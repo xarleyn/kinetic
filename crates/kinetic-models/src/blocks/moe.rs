@@ -74,14 +74,18 @@ impl Gating {
     /// by their share of the `k` probabilities; `logits` become the
     /// probabilities in place.
     pub fn pick(&self, logits: &mut [f32], k: usize) -> Vec<Pick> {
+        self.pick_with_epsilon(logits, k, 0.0)
+    }
+
+    fn pick_with_epsilon(&self, logits: &mut [f32], k: usize, epsilon: f32) -> Vec<Pick> {
         match self {
             Gating::Softmax => {
                 softmax(logits);
-                top_k(logits, None, k)
+                top_k_epsilon(logits, None, k, epsilon)
             }
             Gating::Sigmoid { bias } => {
                 logits.iter_mut().for_each(|x| *x = sigmoid(*x));
-                top_k(logits, Some(bias), k)
+                top_k_epsilon(logits, Some(bias), k, epsilon)
             }
         }
     }
@@ -109,21 +113,41 @@ impl Moe<'_> {
     /// The experts for each row of `h`, [`Moe::n_used`] per row in order of
     /// falling probability, with weights normalized to sum to one.
     pub fn route(&self, h: &[f32]) -> Vec<Pick> {
+        self.route_with_epsilon(h, 0.0)
+    }
+
+    fn route_with_epsilon(&self, h: &[f32], epsilon: f32) -> Vec<Pick> {
         let n_exp = self.n_experts();
         let mut probs = vec![0.0; h.len() / self.router.cols * n_exp];
         matmul(&self.router, h, &mut probs);
         probs
             .chunks_exact_mut(n_exp)
-            .flat_map(|p| self.gating.pick(p, self.n_used))
+            .flat_map(|p| {
+                if epsilon == 0.0 {
+                    self.gating.pick(p, self.n_used)
+                } else {
+                    self.gating.pick_with_epsilon(p, self.n_used, epsilon)
+                }
+            })
             .collect()
     }
 
     /// Adds the routed experts' output for `h` to `shared`, the shared
     /// expert's output for the same rows, after scaling it by its gate.
     pub fn forward(&self, h: &[f32], shared: &mut [f32]) {
+        self.forward_with_epsilon(h, shared, 0.0);
+    }
+
+    /// The pinned Transformers LFM2 oracle uses sum + 1e-6, whereas the
+    /// GGUF autoregressive path uses a floor. Keep the oracle mode explicit.
+    pub(crate) fn forward_with_epsilon(&self, h: &[f32], shared: &mut [f32], epsilon: f32) {
         let d = self.router.cols;
         self.scale_shared(h, shared);
-        let picks = self.route(h);
+        let picks = if epsilon == 0.0 {
+            self.route(h)
+        } else {
+            self.route_with_epsilon(h, epsilon)
+        };
         let k = self.n_used;
         let jobs: Vec<Job> = picks
             .iter()
@@ -314,7 +338,12 @@ fn unpacked_product(
 
 /// The `k` largest of `probs` plus `bias`, largest first, weighted by their
 /// share of the sum of the `k` probabilities.
+#[cfg(test)]
 fn top_k(probs: &[f32], bias: Option<&[f32]>, k: usize) -> Vec<Pick> {
+    top_k_epsilon(probs, bias, k, 0.0)
+}
+
+fn top_k_epsilon(probs: &[f32], bias: Option<&[f32]>, k: usize, epsilon: f32) -> Vec<Pick> {
     let score = |e: u32| probs[e as usize] + bias.map_or(0.0, |b| b[e as usize]);
     let mut order: Vec<u32> = (0..probs.len() as u32).collect();
     order.select_nth_unstable_by(k - 1, |&a, &b| {
@@ -330,11 +359,12 @@ fn top_k(probs: &[f32], bias: Option<&[f32]>, k: usize) -> Vec<Pick> {
         })
         .collect();
     // The floor is the smallest normal f16, as in the reference.
-    let sum = picks
-        .iter()
-        .map(|p| p.weight)
-        .sum::<f32>()
-        .max(6.103_515_6e-5);
+    let sum = picks.iter().map(|p| p.weight).sum::<f32>();
+    let sum = if epsilon == 0.0 {
+        sum.max(6.103_515_6e-5)
+    } else {
+        sum + epsilon
+    };
     picks.iter_mut().for_each(|p| p.weight /= sum);
     picks
 }
@@ -377,6 +407,17 @@ mod tests {
         assert_eq!(picks.iter().map(|p| p.expert).collect::<Vec<_>>(), [2, 0]);
         let (a, b) = (sigmoid(0.0), sigmoid(2.0));
         assert!((picks[0].weight - a / (a + b)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reference_routing_adds_epsilon_without_changing_gguf_normalization() {
+        let probs = [1e-7, 2e-7, 4e-7];
+        let reference = top_k_epsilon(&probs, None, 2, 1e-6);
+        let gguf = top_k(&probs, None, 2);
+        assert_eq!(reference[0].expert, 2);
+        assert_eq!(reference[1].expert, 1);
+        assert_eq!(reference[0].weight, 4e-7 / (6e-7 + 1e-6));
+        assert_eq!(gguf[0].weight, 4e-7 / 6.103_515_6e-5);
     }
 
     #[test]

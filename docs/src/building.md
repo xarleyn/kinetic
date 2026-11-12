@@ -10,7 +10,7 @@ the CUDA kernels also need the CUDA toolkit.
   with "Desktop development with C++").
 - **Linux:** a C toolchain (`build-essential` on Debian and Ubuntu).
 - **For NVIDIA GPUs:** the [CUDA toolkit](https://developer.nvidia.com/cuda-downloads)
-  12.8 or newer, for `nvcc`. It is needed only at build time: the binary opens
+  12.4 or newer, for `nvcc` (12.8 or newer to include Blackwell). It is needed only at build time: the binary opens
   the driver at runtime and links no CUDA library.
 
 ## Build
@@ -36,8 +36,15 @@ On Windows, `nvcc` needs `cl.exe`. From a plain shell, the build finds the
 newest MSVC toolset through `vswhere` and passes it to `nvcc`, so a developer
 prompt is not required.
 
-The kernels are compiled for every NVIDIA architecture from Turing (sm_75) to
-Blackwell (sm_120), plus PTX that newer drivers can compile for later GPUs.
+If the newest MSVC toolset requires a newer CUDA compiler, set `CUDAHOSTCXX`
+to a compatible `cl.exe` or its directory before building. For example, a
+CUDA 12.4 build can select an installed Visual Studio 2022 toolset instead
+of Visual Studio 2026. This setting affects only the CUDA host compiler.
+
+The build queries `nvcc --list-gpu-code` and includes the supported targets
+from Turing (sm_75) to Blackwell (sm_120), warning about targets the installed
+toolkit cannot build. PTX for compute_90 and compute_120 is included when
+those targets are supported, for newer drivers to compile for later GPUs.
 
 Install the binary into `~/.cargo/bin`:
 

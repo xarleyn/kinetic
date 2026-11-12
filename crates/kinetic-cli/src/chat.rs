@@ -743,7 +743,7 @@ impl Helper for Line<'_> {}
 /// Turns on escape sequences in the Windows console, which stays plain
 /// text until a program asks.
 #[cfg(windows)]
-fn enable_escapes() -> bool {
+pub(crate) fn enable_escapes() -> bool {
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
         STD_OUTPUT_HANDLE,
@@ -759,7 +759,7 @@ fn enable_escapes() -> bool {
 }
 
 #[cfg(not(windows))]
-fn enable_escapes() -> bool {
+pub(crate) fn enable_escapes() -> bool {
     true
 }
 

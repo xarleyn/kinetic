@@ -60,6 +60,16 @@ impl Layer<'_> {
         eps: f32,
         mix: impl FnOnce(&[f32]) -> Vec<f32>,
     ) {
+        self.forward_with_routing_epsilon(x, eps, 0.0, mix);
+    }
+
+    pub(crate) fn forward_with_routing_epsilon(
+        &self,
+        x: &mut [f32],
+        eps: f32,
+        routing_epsilon: f32,
+        mix: impl FnOnce(&[f32]) -> Vec<f32>,
+    ) {
         let d = self.width();
         let norm = |x: &mut [f32], w: &Option<Vec<f32>>| {
             if let Some(w) = w {
@@ -87,7 +97,11 @@ impl Layer<'_> {
             None => vec![0.0; h.len()],
         };
         if let Some(moe) = &self.experts {
-            moe.forward(&h, &mut ffn);
+            if routing_epsilon == 0.0 {
+                moe.forward(&h, &mut ffn);
+            } else {
+                moe.forward_with_epsilon(&h, &mut ffn, routing_epsilon);
+            }
         }
         norm(&mut ffn, &self.ffn_out_norm);
         add(x, &ffn);
@@ -738,7 +752,7 @@ impl Model<'_> {
         }
     }
 
-    fn head(&self, rows: &[f32]) -> Vec<f32> {
+    pub(crate) fn head(&self, rows: &[f32]) -> Vec<f32> {
         self.folded_head(&self.head_input(rows))
     }
 
@@ -775,7 +789,7 @@ impl Model<'_> {
         }
     }
 
-    fn norm_rows(&self, x: &mut [f32], w: &[f32]) {
+    pub(crate) fn norm_rows(&self, x: &mut [f32], w: &[f32]) {
         pool::for_each_chunk(x, self.n_embd, |_, row| rms_norm(row, w, self.eps));
     }
 }

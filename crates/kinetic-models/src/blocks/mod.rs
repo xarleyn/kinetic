@@ -12,6 +12,7 @@ mod short_conv;
 mod snapshot;
 mod tree;
 
+pub(crate) use attention::PrefixKv;
 pub use attention::{Attention, Gate, KvCache, Rope, RopeLayout, SharedKv};
 pub use delta_net::{DeltaNet, DeltaNetState};
 pub use folding::Folding;

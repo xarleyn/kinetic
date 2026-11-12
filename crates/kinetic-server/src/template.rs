@@ -138,6 +138,38 @@ mod tests {
         assert!(t.render(json!({})).is_err());
     }
 
+    /// Exercise the complete upstream template, including generation tags,
+    /// Python methods, reasoning history, tool arguments and image markers.
+    #[test]
+    #[ignore = "needs KINETIC_TEST_QWEN36_TEMPLATE"]
+    fn qwen36_template_preserves_thinking_on_request() {
+        let path = std::env::var("KINETIC_TEST_QWEN36_TEMPLATE").unwrap();
+        let source = std::fs::read_to_string(path).unwrap();
+        let template = ChatTemplate::new(&source).unwrap();
+        let mut context = json!({
+            "messages": [
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "First answer", "reasoning_content": "HISTORICAL-REASONING-SENTINEL"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Click here"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,unused"}}
+                ]}
+            ],
+            "tools": [{"type": "function", "function": {"name": "click", "parameters": {"type": "object"}}}],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+            "preserve_thinking": false
+        });
+        let plain = template.render(&context).unwrap();
+        assert!(!plain.contains("HISTORICAL-REASONING-SENTINEL"));
+        assert!(plain.contains("<|vision_start|><|image_pad|><|vision_end|>"));
+        assert!(plain.contains("click"));
+        assert!(plain.ends_with("<think>\n\n</think>\n\n"));
+        context["preserve_thinking"] = true.into();
+        let preserved = template.render(&context).unwrap();
+        assert!(preserved.contains("HISTORICAL-REASONING-SENTINEL"));
+    }
+
     /// xorshift64, so every run draws the same cases and a failure reproduces.
     struct Rng(u64);
 

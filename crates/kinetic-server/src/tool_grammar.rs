@@ -57,7 +57,7 @@ const THINK: &str = r#"think ::= ([^<] | "<" [^/] | "</" [^t])* "</think>" [ \n]
 pub fn grammar(template: &str, tools: &[Value], shape: Shape) -> Result<Grammar, String> {
     let format = Format::of(template);
     let (calls, rules) = match format {
-        Format::Xml => xml(tools, shape.parallel),
+        Format::Xml => xml(tools, shape.parallel)?,
         _ => json_calls(format, tools, shape.parallel)?,
     };
     let lead = if shape.thinking {
@@ -87,10 +87,12 @@ fn literal(text: &str) -> String {
     serde_json::to_string(text).expect("a string serializes")
 }
 
-/// Calls whose structure is held, parameter values free text up to the
-/// next closing tag.
-fn xml(tools: &[Value], parallel: bool) -> (String, String) {
+/// XML strings are unquoted text; structured and scalar JSON parameters
+/// still obey their schemas, just as they do in JSON tool-call formats.
+fn xml(tools: &[Value], parallel: bool) -> Result<(String, String), String> {
     let mut calls = Vec::new();
+    let mut values = String::new();
+    let mut next_value = 0;
     for tool in tools {
         let f = function(tool);
         let name = f["name"].as_str().unwrap_or_default();
@@ -104,9 +106,25 @@ fn xml(tools: &[Value], parallel: bool) -> (String, String) {
             .pointer("/parameters/properties")
             .and_then(Value::as_object)
         {
-            for key in props.keys() {
+            for (key, schema) in props {
+                let value = if schema.get("type").and_then(Value::as_str) == Some("string") {
+                    // Qwen XML spells string values without JSON quotes.
+                    "xvalue".to_owned()
+                } else if schema.get("type").is_some()
+                    || schema.get("const").is_some()
+                    || schema.get("enum").is_some()
+                {
+                    let prefix = format!("xarg{next_value}-");
+                    next_value += 1;
+                    let gbnf = json_schema_to_gbnf(schema)
+                        .map_err(|e| format!("tool parameter {key}: {e}"))?;
+                    values += &prefix_rules(&gbnf, &prefix);
+                    format!("{prefix}root")
+                } else {
+                    "xvalue".to_owned()
+                };
                 let param = format!(
-                    "{} xvalue \"\n</parameter>\n\"",
+                    "{} {value} \"\n</parameter>\n\"",
                     literal(&format!("<parameter={key}>\n"))
                 );
                 match required.contains(&key.as_str()) {
@@ -121,10 +139,46 @@ fn xml(tools: &[Value], parallel: bool) -> (String, String) {
         ));
     }
     let rules = format!(
-        "xcall ::= {}\nxvalue ::= ([^<] | \"<\" [^/])*\n",
+        "xcall ::= {}\nxvalue ::= ([^<] | \"<\" [^/])*\n{values}",
         calls.join(" | ")
     );
-    (repeated("xcall", r#""\n""#, parallel), rules)
+    Ok((repeated("xcall", r#""\n""#, parallel), rules))
+}
+
+/// Namespace generated schema rules without touching their literals or
+/// character classes. Different parameters may each define `root`, `space`,
+/// nested property rules, and so on.
+fn prefix_rules(gbnf: &str, prefix: &str) -> String {
+    let mut out = String::new();
+    let mut chars = gbnf.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '[' {
+            let close = if c == '[' { ']' } else { '"' };
+            out.push(c);
+            while let Some(c) = chars.next() {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if c == close {
+                    break;
+                }
+            }
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            out.push_str(prefix);
+            out.push(c);
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            {
+                out.push(chars.next().unwrap());
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Calls as JSON objects whose names and arguments follow the tools'
@@ -199,6 +253,31 @@ mod tests {
         assert!(!g.matches("Sure, let me check."));
         assert!(!g.matches("<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"));
         assert!(!g.matches("<tool_call>\n<function=other>\n</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn xml_parameters_keep_their_json_types_and_bounds() {
+        let tools = vec![json!({"function": {"name": "click", "parameters": {
+            "type": "object", "properties": {
+                "extra": {"type": "object", "properties": {"root": {"const": "space[foo]"}}, "required": ["root"]},
+                "x": {"type": "integer", "minimum": 0, "maximum": 255},
+                "y": {"type": "integer", "minimum": 0, "maximum": 255}
+            }, "required": ["x", "y"]
+        }}})];
+        let g = grammar("<function=", &tools, Shape::default()).unwrap();
+        let call = |x: &str, y: &str| {
+            format!("<tool_call>\n<function=click>\n<parameter=x>\n{x}\n</parameter>\n<parameter=y>\n{y}\n</parameter>\n</function>\n</tool_call>")
+        };
+        assert!(g.matches(&call("192", "128")));
+        for value in ["[749,494]", "\"192\"", "192.5", "256", "-1", "blue"] {
+            assert!(!g.matches(&call(value, "128")), "accepted {value}");
+        }
+        let nested = call("192", "128").replacen(
+            "<parameter=x>",
+            "<parameter=extra>\n{\"root\": \"space[foo]\"}\n</parameter>\n<parameter=x>",
+            1,
+        );
+        assert!(g.matches(&nested));
     }
 
     #[test]
