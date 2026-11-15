@@ -23,12 +23,43 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   Homebrew's loader and accepts devices whose subgroups are 32 wide without
   being asked.
 
+### Experimental
+
+- `kinetic diffuse-chat`: CPU diffusion conversation with history, prefix reuse,
+  animated canvas progress, committed-prefix streaming, Markdown, cancellation
+  and console commands. The supplied synthetic fixture is explicitly labeled untrained.
+
+- CPU diffusion `--prefix-reuse` prepares causal prefix KV and convolution
+  boundary states once per block. Bitwise full/reuse conformance and generation
+  timings for canvas 16/32/64 are reproducible with `scripts/diffusion-prefix-reuse.cs`.
+
+- CPU `kinetic diffuse` for explicitly marked LFM2 MoE GGUF checkpoints:
+  mask embeddings, prefix-LM attention, full recomputation and a fixed greedy
+  commit schedule. A pinned Python reference checks every canvas logit and
+  commit on an untrained scaled FP32 fixture; full 24B weights are untested.
+
 ### Fixed
 
 - Vulkan: a recorded command graph kept resetting a timestamp query pool
   that had been destroyed with its recording. Drivers on Metal crashed on it.
 
+- Empty attention slot intersections no longer evaluate an unsigned subtraction
+  before returning `None`, fixing six debug-mode attention/tree test failures.
+
+- End-of-generation markers still stop decoding when their token also serves
+  as BOS, as in Qwen3.6 GGUF files, including tokenizers that add BOS/EOS wrappers.
+
+- Forced Qwen XML tool calls constrain non-string parameter values to their
+  JSON schemas, including integer bounds, instead of accepting arbitrary text.
+- CUDA builds skip GPU targets unknown to the installed toolkit and accept
+  `CUDAHOSTCXX` to select a compatible host compiler on Windows.
+- Real-model CUDA identity tests distinguish MoE expert offload from dense
+  layer splitting instead of requiring host layers in a Flywheel model.
+
 ### Models
+
+- Verified Qwen3.6-35B-A3B (`qwen35moe`) and Player-1-9B (`qwen35`),
+  including matching vision projectors and model-specific chat templates.
 
 - Gemma 4 (`gemma4`) on the CPU and CUDA, with images through its `gemma4v`
   projector.

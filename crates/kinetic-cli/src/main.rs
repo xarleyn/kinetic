@@ -6,6 +6,8 @@ mod bench;
 mod chat;
 mod compare;
 mod console;
+mod diffusion;
+mod diffusion_chat;
 mod doctor;
 mod fit;
 mod fix;
@@ -66,6 +68,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Interactive CPU diffusion chat with animated progress and Markdown
+    DiffuseChat {
+        #[command(flatten)]
+        args: diffusion_chat::ChatArgs,
+    },
+    /// Experimental CPU masked diffusion for marked LFM2 MoE checkpoints
+    Diffuse {
+        #[command(flatten)]
+        args: diffusion::DiffuseArgs,
+    },
     /// Answer one prompt, streamed to stdout (reads stdin without a prompt)
     Run {
         #[command(flatten)]
@@ -577,6 +589,14 @@ fn finish(result: Result<()>) -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::DiffuseChat { args } => {
+            set_threads(args.threads)?;
+            diffusion_chat::run(args)
+        }
+        Command::Diffuse { args } => {
+            set_threads(args.threads)?;
+            diffusion::run(args)
+        }
         Command::Run {
             model,
             prompt,

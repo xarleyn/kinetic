@@ -519,7 +519,7 @@ Examples: [Python, C and Rust](https://veloresearch.github.io/kinetic/bindings.h
 
 | Family | GGUF architecture | Notes |
 |---|---|---|
-| Qwen3.5, dense and MoE | `qwen35`, `qwen35moe` | drafts from its MTP block, images |
+| Qwen3.5 dense and MoE, Qwen3.6-35B-A3B, Player-1-9B | `qwen35`, `qwen35moe` | images; drafts when the file includes an MTP block |
 | Gemma 4 | `gemma4` | E2B and E4B with images; the 26B A4B mixture of experts is not supported yet |
 | Qwen3, Qwen2.5 | `qwen3`, `qwen2` | thinking and tool calls |
 | Llama 3, Mistral, SmolLM2 | `llama` | |
@@ -535,6 +535,15 @@ Examples: [Python, C and Rust](https://veloresearch.github.io/kinetic/bindings.h
 
 Images need the model's vision projector (`mmproj`): `qwen3vl_merger` for
 Qwen3.5, `gemma4v` for Gemma 4.
+
+An experimental CPU `kinetic diffuse` command runs explicitly marked LFM2 MoE
+diffusion checkpoints with a small canvas and fixed greedy commits.
+[Prototype and Python conformance checks](docs/diffusion-lfm25-prototype.md)
+use an untrained scaled FP32 fixture; the full 24B adaptation is untested.
+Its CPU [`--prefix-reuse` path](docs/diffusion-lfm25-prefix-reuse.md) reuses
+prefix KV and convolution boundary states and is checked against full recomputation.
+[`kinetic diffuse-chat`](docs/diffusion-chat.md) adds an interactive terminal
+conversation, animated canvas progress and streamed Markdown for these checkpoints.
 
 **Weights:** F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, the K-quants
 (Q2_K to Q6_K), the IQ formats (IQ1_S to IQ4_XS), TQ1_0, TQ2_0, MXFP4 and

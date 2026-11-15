@@ -38,8 +38,8 @@ The names are the GGUF `general.architecture` values.
 
 | Architecture | Models | CPU | CUDA |
 |---|---|:-:|:-:|
-| `qwen35` | Qwen3.5, with its multi-token prediction block | yes | yes |
-| `qwen35moe` | Qwen3.5 mixture of experts, such as 35B-A3B | yes | yes, also larger than GPU memory |
+| `qwen35` | Qwen3.5 and derivatives such as Player-1-9B, optionally with a multi-token prediction block | yes | yes |
+| `qwen35moe` | Qwen3.5 and Qwen3.6 mixtures of experts, such as 35B-A3B | yes | yes, also larger than GPU memory |
 | `lfm3` | LFM3 | yes | yes |
 | `lfm2` | LFM2 | yes | yes |
 | `lfm2moe` | LFM2.5 mixture of experts, such as 8B-A1B (experimental, slower than llama.cpp on CUDA for now) | yes | yes, also larger than GPU memory |
@@ -127,6 +127,13 @@ are supported: `qwen35`, `qwen2`, `llama3`, `llama-v3`, `llama-bpe`, `lfm2`,
 The chat template is the file's own Jinja template, rendered as the model's
 authors wrote it, or the one `--chat-template-file` names. Tool calls are
 read in the formats of Qwen3.5, Qwen3, LFM3, LFM2, Llama 3 and Mistral.
+
+Qwen3.6-35B-A3B uses `qwen35moe`; Player-1-9B uses `qwen35` and its own
+full-history template. For Player-1, use its checkpoint's matching vision
+projector and pass the project's `qwen3_5_player1_full_history.jinja` with
+`--chat-template-file`. A GGUF conversion may omit the original checkpoint's
+MTP tensors: only files that `kinetic info` marks with `prediction yes` can
+draft from MTP. Lookup drafting still works without an MTP block.
 
 ## Weight formats
 

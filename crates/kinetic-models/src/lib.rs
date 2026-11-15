@@ -10,6 +10,7 @@ mod convoy;
 pub mod cuda;
 #[cfg(any(feature = "cuda", feature = "vulkan"))]
 mod device_state;
+pub mod diffusion;
 mod embed;
 mod folds;
 mod head;
@@ -74,6 +75,11 @@ pub fn load_with<'a>(
     file: &'a dyn TensorSource,
     rope: &RopeScaling,
 ) -> Result<Model<'a>, LoadError> {
+    if file.header().get(diffusion::MODE_KEY).is_some() {
+        return Err(LoadError(
+            "this is a diffusion checkpoint; use kinetic diffuse".into(),
+        ));
+    }
     let arch = architecture(file)?;
     if arch::family(arch).is_some_and(|f| !matches!(f.body, Body::Decoder(_))) {
         return Err(LoadError(format!(

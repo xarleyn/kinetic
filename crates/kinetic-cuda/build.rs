@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CUDAHOSTCXX");
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
         .join("kernels.fatbin");
@@ -40,9 +41,30 @@ fn main() {
     cmd.args(["-fatbin", "-O3", "-std=c++17", "-o"])
         .arg(&out)
         .arg(SOURCE);
+    // Older toolkits can build for the GPUs they know, even if a newer
+    // toolkit is needed to include Blackwell machine code. Keep PTX for the
+    // newest supported target so the driver can still JIT on newer GPUs.
+    let targets = Command::new(&nvcc)
+        .arg("--list-gpu-code")
+        .output()
+        .expect("query nvcc GPU targets");
+    assert!(targets.status.success(), "nvcc --list-gpu-code failed");
+    let targets = String::from_utf8_lossy(&targets.stdout);
+    let mut included = 0;
     for gencode in GENCODE {
-        cmd.args(["-gencode", gencode]);
+        let arch = gencode
+            .split(',')
+            .next()
+            .unwrap()
+            .replace("arch=compute_", "sm_");
+        if targets.lines().any(|line| line.trim() == arch) {
+            cmd.args(["-gencode", gencode]);
+            included += 1;
+        } else {
+            println!("cargo:warning=nvcc does not support {arch}; skipping that GPU target");
+        }
     }
+    assert!(included > 0, "nvcc supports none of Kinetic's GPU targets");
     if cfg!(windows) {
         // nvcc checks the MSVC version against a list fixed at its release;
         // newer toolsets compile these kernels fine.
@@ -79,6 +101,9 @@ fn find_nvcc() -> Option<PathBuf> {
 /// rather than a developer prompt), the newest MSVC toolset found by vswhere
 /// is passed to nvcc instead.
 fn find_msvc() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("CUDAHOSTCXX") {
+        return Some(path.into());
+    }
     if !cfg!(windows) || Command::new("cl.exe").output().is_ok() {
         return None;
     }

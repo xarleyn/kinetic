@@ -28,6 +28,7 @@ mod rerank;
 mod sequence;
 mod server;
 mod template;
+pub use template::ChatTemplate;
 mod text;
 mod tool_calls;
 mod tool_grammar;

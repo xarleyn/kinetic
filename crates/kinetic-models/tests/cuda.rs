@@ -28,6 +28,15 @@ fn batches_and_rollbacks_change_no_bit() {
     rollback_leaves_the_state_as_if_never_run(&gpu);
     a_host_copy_restores_the_state(&gpu, &model);
     shared_passes_match_running_alone(&gpu);
+    if let Some(plan) = gpu.plan() {
+        // Flywheel keeps the layers on the GPU and offloads experts, so
+        // the dense-only layer-splitting checks below do not apply. The
+        // batch, rollback, host snapshot and shared-pass checks above do.
+        assert_eq!(gpu.host_layers(), 0);
+        assert!(plan.cache_bytes() <= plan.expert_bytes);
+        eprintln!("MoE placement: {plan}");
+        return;
+    }
     let full = gpu.weight_bytes();
     drop(gpu);
 

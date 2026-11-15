@@ -190,19 +190,7 @@ impl<'a> Engine<'a> {
         };
         let (bos, eos) = (text(tokenizer.bos()), text(tokenizer.eos()));
 
-        let mut stop_tokens: Vec<u32> = tokenizer.eos().into_iter().collect();
-        for marker in END_OF_TURN {
-            let ids = tokenizer.encode(marker, true);
-            let ids: Vec<u32> = ids
-                .into_iter()
-                .filter(|&id| Some(id) != tokenizer.bos())
-                .collect();
-            if let [id] = ids[..] {
-                if !stop_tokens.contains(&id) {
-                    stop_tokens.push(id);
-                }
-            }
-        }
+        let stop_tokens = generation_stops(&tokenizer);
 
         Ok(Engine {
             name: name.into(),
@@ -759,6 +747,24 @@ fn before_last_word(text: &str) -> &str {
         .map_or("", |i| text[..i].trim_end())
 }
 
+/// Match the marker itself, not the BOS/EOS wrappers `encode` may add.
+/// A BOS such as Qwen's <|endoftext|> can also end a generation.
+fn generation_stops(tokenizer: &Tokenizer) -> Vec<u32> {
+    let mut stops: Vec<u32> = tokenizer.eos().into_iter().collect();
+    for marker in END_OF_TURN {
+        let id = tokenizer
+            .encode(marker, true)
+            .into_iter()
+            .find(|&id| tokenizer.piece(id) == marker.as_bytes());
+        if let Some(id) = id {
+            if !stops.contains(&id) {
+                stops.push(id);
+            }
+        }
+    }
+    stops
+}
+
 fn recommended_sampling(gguf: &Gguf) -> Sampling {
     let f = |key: &str| {
         gguf.get(&format!("general.sampling.{key}"))
@@ -783,7 +789,51 @@ fn recommended_sampling(gguf: &Gguf) -> Sampling {
 
 #[cfg(test)]
 mod tests {
-    use super::before_last_word;
+    use super::{before_last_word, generation_stops};
+    use kinetic_gguf::{Gguf, Value};
+    use kinetic_tokenizer::Tokenizer;
+
+    #[test]
+    fn a_bos_that_also_ends_generation_is_not_discarded() {
+        for (bos, add_bos, add_eos) in [(0, false, false), (0, true, true), (2, true, true)] {
+            let header = Gguf {
+                version: 3,
+                alignment: 32,
+                data_offset: 0,
+                tensors: Vec::new(),
+                metadata: vec![
+                    ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                    ("tokenizer.ggml.pre".into(), Value::String("qwen35".into())),
+                    (
+                        "tokenizer.ggml.tokens".into(),
+                        Value::Array(
+                            ["<|endoftext|>", "<|im_end|>", "<BOS>", "<|im_start|>"]
+                                .into_iter()
+                                .map(|s| Value::String(s.into()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "tokenizer.ggml.token_type".into(),
+                        Value::Array(vec![Value::I32(3); 4]),
+                    ),
+                    ("tokenizer.ggml.merges".into(), Value::Array(Vec::new())),
+                    ("tokenizer.ggml.bos_token_id".into(), Value::U32(bos)),
+                    ("tokenizer.ggml.eos_token_id".into(), Value::U32(1)),
+                    ("tokenizer.ggml.add_bos_token".into(), Value::Bool(add_bos)),
+                    ("tokenizer.ggml.add_eos_token".into(), Value::Bool(add_eos)),
+                ],
+            };
+            let tokenizer = Tokenizer::from_gguf(&header).unwrap();
+            let stops = generation_stops(&tokenizer);
+            assert!(
+                stops.contains(&0),
+                "BOS={bos}, add_bos={add_bos}, add_eos={add_eos}"
+            );
+            assert!(stops.contains(&1));
+            assert_eq!(stops.len(), 2);
+        }
+    }
 
     #[test]
     fn a_draft_stops_before_its_last_word() {
