@@ -26,6 +26,7 @@ impl ConvState {
     /// tokens run between a checkpoint and its rollback.
     pub fn new(
         ctx: &Rc<Context>,
+        stream: &Stream,
         channels: usize,
         taps: usize,
         max_tokens: usize,
@@ -37,7 +38,7 @@ impl ConvState {
         }
         let ring_len = taps - 1 + max_tokens;
         let mut ring = DeviceBuffer::new(ctx, ring_len * channels)?;
-        ring.zero()?;
+        ring.zero_on(stream)?;
         Ok(ConvState {
             ring,
             channels,

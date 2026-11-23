@@ -21,6 +21,8 @@ const CHUNK: usize = 32;
 /// delta_scan.cuh.
 const SCAN_ROWS: usize = 32;
 const SCAN_THREADS: usize = 64;
+/// Threads of the f32 chunk scan; must match DSCAN32_THREADS.
+const SCAN_F32_THREADS: usize = 128;
 const RING_THREADS: usize = 256;
 
 /// The fixed shape of a gated delta-rule layer.
@@ -139,13 +141,18 @@ pub struct DeltaState {
 impl DeltaState {
     /// A zero state that records up to `max_tokens` tokens between a
     /// checkpoint and its rollback, and runs up to that many per pass.
-    pub fn new(ctx: &Rc<Context>, shape: &DeltaShape, max_tokens: usize) -> Result<DeltaState> {
+    pub fn new(
+        ctx: &Rc<Context>,
+        stream: &Stream,
+        shape: &DeltaShape,
+        max_tokens: usize,
+    ) -> Result<DeltaState> {
         shape.check()?;
         let ring_len = shape.conv_taps - 1 + max_tokens;
         let mut ring = DeviceBuffer::new(ctx, ring_len * shape.channels())?;
         let mut state = DeviceBuffer::new(ctx, shape.state_len())?;
-        ring.zero()?;
-        state.zero()?;
+        ring.zero_on(stream)?;
+        state.zero_on(stream)?;
         Ok(DeltaState {
             ring,
             journal: DeviceBuffer::new(ctx, max_tokens * shape.journal_stride())?,
@@ -307,10 +314,12 @@ impl Kernels {
     /// norms, the recurrence as `flow` says, then the gated output norm into
     /// `io.out`.
     ///
-    /// Batches of more than [`MAX_BATCH`] tokens must commit and have value
-    /// heads of 128; they run the recurrence in chunks on tensor cores, as
-    /// accurate as f32 arithmetic but in another order, so their results
-    /// differ slightly from smaller batches.
+    /// Batches of more than [`MAX_BATCH`] tokens must commit. With value
+    /// heads of 128 they run the recurrence in chunks, on tensor cores as
+    /// accurate as f32 arithmetic, without them in f32, in another order
+    /// than steps, so their results differ slightly from smaller batches;
+    /// other heads run as steps of [`MAX_BATCH`] tokens with the results of
+    /// smaller batches.
     pub fn delta_net(
         &self,
         params: DeltaParams,
@@ -342,10 +351,16 @@ impl Kernels {
             )));
         }
         io.out.check_rows(n)?;
-        if n > MAX_BATCH {
+        let chunked = self.tensor_cores || (flow == Flow::Commit && s.head_v_dim == HEAD_K_DIM);
+        if n > MAX_BATCH && chunked {
             return self.delta_batch(params, io, state, flow, batch, stream);
         }
-        if first + n > state.max_tokens {
+        if n > MAX_BATCH && flow != Flow::Commit {
+            return Err(Error::Shape(format!(
+                "{n} tokens of {s:?} in one pass need to commit"
+            )));
+        }
+        if first + n.min(MAX_BATCH) > state.max_tokens {
             return Err(Error::Shape(format!(
                 "{} tokens since the checkpoint where the journal holds {}",
                 first + n,
@@ -353,29 +368,53 @@ impl Kernels {
             )));
         }
 
-        let mut args = DeltaArgs::new(&params, state, n, first);
-        args.batch = batch.device_ptr();
-        args.qkv = io.qkv.device_ptr();
-        args.alpha = io.alpha.device_ptr();
-        args.beta = io.beta.device_ptr();
-        args.out = io.scratch.device_ptr();
-        args.z = io.z.device_ptr();
-        args.gated = io.out.act();
-        if let Flow::Record { first } = flow {
-            if first > 0 {
-                args.s_in = state.spare.device_ptr();
+        // Larger batches of other heads (devices without tensor cores)
+        // commit a step of MAX_BATCH tokens at a time, each as a batch of
+        // its own.
+        let (gated, f32s) = (io.out.act(), |at: usize, per: usize| 4 * (at * per) as u64);
+        for at in (0..n).step_by(MAX_BATCH) {
+            let m = (n - at).min(MAX_BATCH);
+            let mut args = DeltaArgs::new(&params, state, m, first);
+            args.batch = if at == 0 {
+                batch.device_ptr()
+            } else {
+                batch.step_ptr(at)
+            };
+            args.qkv = io.qkv.device_ptr() + f32s(at, s.channels());
+            args.alpha = io.alpha.device_ptr() + f32s(at, s.n_v_heads);
+            args.beta = io.beta.device_ptr() + f32s(at, s.n_v_heads);
+            args.out = io.scratch.device_ptr();
+            args.z = io.z.device_ptr() + f32s(at, s.value_dim());
+            args.gated = gated.skip_inputs(at, s.value_dim());
+            if let Flow::Record { first } = flow {
+                if first > 0 {
+                    args.s_in = state.spare.device_ptr();
+                }
+                args.s_out = state.spare.device_ptr();
             }
-            args.s_out = state.spare.device_ptr();
+            self.delta_step(&args, s, m, stream)?;
         }
-        // SAFETY: the kernels take `DeltaArgs`. Every buffer was checked to
-        // hold what `n` tokens of this shape touch; journal rows stay below
-        // `max_tokens` and ring rows wrap below `ring_len`.
+        Ok(())
+    }
+
+    /// Launches the convolution, recurrence and gated norm of a batch of up
+    /// to [`MAX_BATCH`] tokens.
+    fn delta_step(
+        &self,
+        args: &DeltaArgs,
+        s: &DeltaShape,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        // SAFETY: the kernels take `DeltaArgs`. The caller checked that every
+        // buffer holds what `n` tokens of this shape touch; journal rows stay
+        // below `max_tokens` and ring rows wrap below `ring_len`.
         unsafe {
             launch_struct(
                 &self.delta_conv,
                 config([s.channels() / s.head_k_dim, 1], s.head_k_dim),
                 stream,
-                &args,
+                args,
             )?;
             launch_struct(
                 &self.delta_rule,
@@ -384,13 +423,13 @@ impl Kernels {
                     RULE_THREADS as usize,
                 ),
                 stream,
-                &args,
+                args,
             )?;
             launch_struct(
                 &self.delta_gated_norm,
                 config([n, s.n_v_heads], s.head_v_dim),
                 stream,
-                &args,
+                args,
             )
         }
     }
@@ -449,9 +488,13 @@ impl Kernels {
                 stream,
                 &args,
             )?;
+            let (scan, threads) = match self.tensor_cores {
+                true => (&self.delta_chunk_scan, SCAN_THREADS),
+                false => (&self.delta_chunk_scan_f32, SCAN_F32_THREADS),
+            };
             launch_struct(
-                &self.delta_chunk_scan,
-                config([s.n_v_heads, s.head_v_dim / SCAN_ROWS], SCAN_THREADS),
+                scan,
+                config([s.n_v_heads, s.head_v_dim / SCAN_ROWS], threads),
                 stream,
                 &args,
             )?;

@@ -19,7 +19,9 @@ param(
     # A release such as 0.1.0; the latest by default.
     [string]$Version = '',
     # Install the smaller CPU-only build.
-    [switch]$Cpu
+    [switch]$Cpu,
+    # Install the nightly build of main: untested, replaced every night.
+    [switch]$Nightly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +33,9 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'Kinetic needs 64-bit Windows.'
 }
 
+if ($Nightly) {
+    $Version = 'nightly'
+}
 if (-not $Version) {
     $latest = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest" -Headers @{ 'User-Agent' = 'kinetic-install' }
     $Version = $latest.tag_name
@@ -40,7 +45,9 @@ $Version = $Version.TrimStart('v')
 # the cuda archive is the full build: CUDA, Vulkan and the CPU in one binary
 $variant = if ($Cpu) { 'cpu' } else { 'cuda' }
 $name = "kinetic-$Version-windows-x86_64-$variant"
-$base = "https://github.com/$repo/releases/download/v$Version"
+# the nightly prerelease: an untested build of main, replaced every night
+$tag = if ($Version -eq 'nightly') { 'nightly' } else { "v$Version" }
+$base = "https://github.com/$repo/releases/download/$tag"
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "kinetic-install-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null

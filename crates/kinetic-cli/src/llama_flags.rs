@@ -74,7 +74,7 @@ const UNSUPPORTED: &[(&[&str], &str)] = &[
             "-ot",
             "--override-tensor",
         ],
-        "Kinetic runs the model wholly on one device; choose it with --device",
+        "Kinetic splits a model by layers only; choose the device with --device, and spread the layers over several CUDA GPUs with --gpus 0,1",
     ),
     (
         &[
@@ -156,6 +156,9 @@ pub fn dispatch(mut args: Vec<String>) -> Vec<String> {
 /// Rewrites renamed flags and drops those for what Kinetic does by itself,
 /// or returns what to say about an unsupported one.
 pub fn translate(args: Vec<String>) -> Result<Vec<String>, String> {
+    // `pull` has its own `--file` for the GGUF to download; it is not
+    // llama.cpp's `-f`/`--file` for a prompt file.
+    let is_pull = args.get(1).map(String::as_str) == Some("pull");
     let mut out = Vec::with_capacity(args.len());
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -210,7 +213,9 @@ pub fn translate(args: Vec<String>) -> Result<Vec<String>, String> {
             continue;
         }
         if let Some((_, why)) = UNSUPPORTED.iter().find(|(names, _)| names.contains(&name)) {
-            return Err(format!("{name} is a llama.cpp flag: {why}."));
+            if !(is_pull && name == "--file") {
+                return Err(format!("{name} is a llama.cpp flag: {why}."));
+            }
         }
         out.push(arg);
     }
@@ -254,6 +259,14 @@ mod tests {
             translate(args(&line)).unwrap(),
             args(&["serve", "-m", "m.gguf", "--port", "8081"])
         );
+    }
+
+    #[test]
+    fn pull_keeps_its_own_file_flag() {
+        let line = ["kinetic", "pull", "org/repo", "--file", "model-Q4_K_M.gguf"];
+        assert_eq!(translate(args(&line)).unwrap(), args(&line));
+        // Other commands still get the llama.cpp explanation.
+        assert!(translate(args(&["kinetic", "run", "m.gguf", "--file", "p"])).is_err());
     }
 
     #[test]

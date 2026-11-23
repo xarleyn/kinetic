@@ -1,0 +1,75 @@
+name: Nightly
+
+# Builds main every night it has changed and publishes the archives as the
+# prerelease "nightly", replacing the last one: untested builds for trying
+# fixes before the next release. No Python wheels, nothing on PyPI.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  changed:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      label: ${{ steps.check.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          head=$(git rev-parse HEAD)
+          last=$(git ls-remote origin refs/tags/nightly | cut -f1)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "label=nightly $(date -u +%F) ${head:0:7}" >> "$GITHUB_OUTPUT"
+          if [ "$head" = "$last" ] && [ "${{ github.event_name }}" = schedule ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "main $head, last nightly ${last:-none}, version $version"
+
+  build:
+    needs: changed
+    if: needs.changed.outputs.build == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      version: nightly
+      build: ${{ needs.changed.outputs.label }}
+      wheels: false
+
+  publish:
+    needs: [changed, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ needs.changed.outputs.label }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          # 0.1, not 0.1.0
+          case "$version" in *.*.0) version="${version%.0}" ;; esac
+          gh release delete nightly --cleanup-tag --yes || true
+          git tag -f nightly HEAD
+          git push -f origin refs/tags/nightly
+          notes="An untested build of main ($LABEL), made every night main changes. It is meant for trying fixes before the next release; for everything else use the latest release. Install it with \`install.sh --nightly\` or \`install.ps1 -Nightly\`."
+          gh release create nightly dist/* --prerelease --latest=false --verify-tag \
+            --title "Kinetic $version $LABEL (beta)" --notes "$notes"

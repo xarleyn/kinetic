@@ -164,6 +164,11 @@ model's raw logits, as llama-server reports them, before any sampler. With
 speculative decoding every sampler stays exact: a seeded answer and its
 log-probabilities are the same with drafting as without.
 
+In chat completions, both streaming and non-streaming logprobs omit trailing
+tokens entirely hidden by a stop string or an unfinished UTF-8 character.
+If a stop string leaves part of a token in the text, its logprob is kept.
+`usage.completion_tokens` still counts all generated tokens, including EOS.
+
 `/v1/completions` takes `logprobs` as a count of alternatives, 0 to 20, and
 answers in the legacy shape: `tokens`, `token_logprobs`, `top_logprobs` and
 `text_offset`.

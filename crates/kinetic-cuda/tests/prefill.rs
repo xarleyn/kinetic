@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{gpu, Gpu, Lcg};
+use common::{gpu, large_batch_gpu, Gpu, Lcg};
 use kinetic_cuda::{
     AttentionIo, AttentionParams, AttentionShape, Batch, ConvState, DeltaIo, DeltaParams,
     DeltaShape, DeltaState, DeviceBuffer, Flow, GemvInput, KvCache, KvType, MAX_BATCH,
@@ -66,12 +66,14 @@ fn outputs(
 }
 
 /// Every output row of [`outputs`] for random attention inputs over a cache
-/// storing keys as `k` and values as `v`.
+/// storing keys as `k` and values as `v`. With `copied` each batch comes
+/// from one of another capacity, as layers on a next device take theirs.
 fn attention_outputs(
     gpu: &Gpu,
     shape: AttentionShape,
     [kt, vt]: [KvType; 2],
     batched: bool,
+    copied: bool,
 ) -> Vec<f32> {
     let total = PROMPT + MAX_BATCH;
     let (hd, kv_dim) = (shape.head_dim, shape.n_head_kv * shape.head_dim);
@@ -88,11 +90,17 @@ fn attention_outputs(
     let mut cache = KvCache::with_types(&gpu.ctx, &shape, slots, kt, vt).unwrap();
     {
         let mut batch = Batch::new(&gpu.ctx, PROMPT).unwrap();
+        let mut source = Batch::new(&gpu.ctx, 2 * PROMPT).unwrap();
         let mut out = GemvInput::batch(&gpu.ctx, width, PROMPT).unwrap();
         let mut scratch = DeviceBuffer::new(&gpu.ctx, shape.scratch_len(MAX_BATCH, slots)).unwrap();
         outputs(total, batched, |first, n| {
             let range = first..first + n;
-            batch.set(first, &vec![0; n], &gpu.stream).unwrap();
+            if copied {
+                source.set(first, &vec![0; n], &gpu.stream).unwrap();
+                batch.copy_from(&source, &gpu.stream).unwrap();
+            } else {
+                batch.set(first, &vec![0; n], &gpu.stream).unwrap();
+            }
             let mut q = rows(gpu, &q_all, range.clone(), shape.q_len());
             let mut k = rows(gpu, &k_all, range.clone(), kv_dim);
             let v = rows(gpu, &v_all, range.clone(), kv_dim);
@@ -126,11 +134,29 @@ fn attention_outputs(
 }
 
 fn check_attention(shape: AttentionShape) {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = large_batch_gpu() else { return };
     let f16 = [KvType::F16; 2];
-    let steps = attention_outputs(&gpu, shape, f16, false);
-    let batched = attention_outputs(&gpu, shape, f16, true);
-    assert_close(&format!("attention {shape:?}"), &batched, &steps, 1e-5);
+    let steps = attention_outputs(&gpu, shape, f16, false, false);
+    let batched = attention_outputs(&gpu, shape, f16, true, false);
+    // the P100's tile adds its terms in f16 pairs, the products' rounding
+    let tol = if gpu.kernels.half_products() {
+        3e-3
+    } else {
+        1e-5
+    };
+    assert_close(&format!("attention {shape:?}"), &batched, &steps, tol);
+}
+
+/// A batch handed to another device keeps the positions of every step, so
+/// kernels that take a long batch a step at a time see them there too.
+#[test]
+fn a_copied_batch_attends_like_its_source() {
+    let Some(gpu) = large_batch_gpu() else { return };
+    let shape = attention_shape(64, None, false);
+    let f16 = [KvType::F16; 2];
+    let steps = attention_outputs(&gpu, shape, f16, false, false);
+    let copied = attention_outputs(&gpu, shape, f16, true, true);
+    assert_close("copied batch", &copied, &steps, 1e-5);
 }
 
 fn attention_shape(
@@ -171,21 +197,21 @@ fn windowed_flash_attention_matches_steps() {
 
 #[test]
 fn q8_0_cache_stays_close_to_f16() {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = large_batch_gpu() else { return };
     for shape in [
         attention_shape(256, None, true),
         attention_shape(64, Some(40), false),
     ] {
-        let exact = attention_outputs(&gpu, shape, [KvType::F16; 2], false);
+        let exact = attention_outputs(&gpu, shape, [KvType::F16; 2], false, false);
         for types in [
             [KvType::Q8_0; 2],
             [KvType::Q8_0, KvType::F16],
             [KvType::F16, KvType::Q8_0],
         ] {
-            let steps = attention_outputs(&gpu, shape, types, false);
+            let steps = attention_outputs(&gpu, shape, types, false, false);
             assert_close(&format!("{types:?} {shape:?}"), &steps, &exact, 2e-2);
             // the flash kernel widens q8_0 to f16 tiles
-            let batched = attention_outputs(&gpu, shape, types, true);
+            let batched = attention_outputs(&gpu, shape, types, true, false);
             assert_close(
                 &format!("flash {types:?} {shape:?}"),
                 &batched,
@@ -215,7 +241,7 @@ fn q8_0_cache_saves_and_loads_unchanged() {
 
 #[test]
 fn chunked_delta_rule_matches_steps() {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = large_batch_gpu() else { return };
     let shape = DeltaShape {
         n_k_heads: 2,
         n_v_heads: 4,
@@ -245,7 +271,7 @@ fn chunked_delta_rule_matches_steps() {
     };
 
     let run = |batched: bool| {
-        let mut state = DeltaState::new(&gpu.ctx, &shape, MAX_BATCH).unwrap();
+        let mut state = DeltaState::new(&gpu.ctx, &gpu.stream, &shape, MAX_BATCH).unwrap();
         let mut batch = Batch::new(&gpu.ctx, PROMPT).unwrap();
         let mut out = GemvInput::batch(&gpu.ctx, vd, PROMPT).unwrap();
         let mut scratch = DeviceBuffer::new(&gpu.ctx, shape.scratch_len(PROMPT)).unwrap();
@@ -286,7 +312,7 @@ fn batched_short_conv_matches_steps() {
     let conv = upload(&gpu, &random(&mut rng, channels * taps, 1.0));
 
     let run = |batched: bool| {
-        let mut state = ConvState::new(&gpu.ctx, channels, taps, MAX_BATCH).unwrap();
+        let mut state = ConvState::new(&gpu.ctx, &gpu.stream, channels, taps, MAX_BATCH).unwrap();
         let mut batch = Batch::new(&gpu.ctx, PROMPT).unwrap();
         let mut out = GemvInput::batch(&gpu.ctx, channels, PROMPT).unwrap();
         outputs(total, batched, |first, n| {

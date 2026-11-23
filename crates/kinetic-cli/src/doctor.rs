@@ -36,8 +36,25 @@ pub fn run() -> Result<()> {
         gib(m.ram_available),
         bandwidth / 1e9
     )?;
+    // numbered as --gpus takes them, where there is a choice
+    let several = gpus.iter().filter(|g| g.api == "CUDA").count() > 1;
+    let mut cuda_index = 0;
     for g in &gpus {
-        writeln!(out, "  gpu      {}", describe(g))?;
+        let label = match g.api == "CUDA" && several {
+            true => {
+                cuda_index += 1;
+                format!("gpu {:<5}", cuda_index - 1)
+            }
+            false => "gpu      ".into(),
+        };
+        writeln!(out, "  {label}{}", describe(g))?;
+    }
+    let (links, link_fixes) = match several {
+        true => system::cuda_links(),
+        false => (Vec::new(), Vec::new()),
+    };
+    for l in &links {
+        writeln!(out, "  gpus     {l}")?;
     }
     for n in &notes {
         writeln!(out, "  gpu      {n}")?;
@@ -64,7 +81,7 @@ pub fn run() -> Result<()> {
         )?;
     }
 
-    let mut fixes = Vec::new();
+    let mut fixes = link_fixes;
     if !m.fast_kernels() {
         fixes.push(format!(
             "this CPU lacks {}, which Kinetic's CPU kernels use; expect slow CPU runs",
@@ -88,10 +105,7 @@ pub fn run() -> Result<()> {
     }
     for g in &gpus {
         if let Some(problem) = &g.problem {
-            fixes.push(format!(
-                "{} through {}: {problem}; update its driver",
-                g.name, g.api
-            ));
+            fixes.push(format!("{} through {}: {problem}", g.name, g.api));
         }
         if let Some(free) = g.memory_free {
             if g.memory_total >= 4 << 30 && free < 1 << 30 {

@@ -23,6 +23,10 @@ Windows, and into `~/.local/bin` on Linux and macOS. `-Version 0.1.0` /
 `--version 0.1.0` picks a release and `-Cpu` / `--cpu` the smaller CPU-only
 build. macOS has one build, which uses the GPU through Metal.
 
+`-Nightly` / `--nightly` installs the nightly build instead: main as it was
+last night, untested, for trying a fix before the next release. `kinetic
+--version` then says which night and commit it is.
+
 ## Release binaries
 
 From the [releases page](https://github.com/Veloresearch/kinetic/releases),
@@ -97,6 +101,20 @@ on the host:
 ```sh
 docker build -f docker/Dockerfile.cuda -t kinetic:cuda .
 docker run --rm --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" kinetic:cuda /models/model.gguf
+```
+
+`--build-arg CUDA_ARCHS="60;61"` builds the kernels for those compute
+capabilities only (here Tesla P100 and GTX 10 series), which is much faster
+than building for every GPU from Pascal on.
+
+With Podman, the NVIDIA Container Toolkit's CDI devices take the place of
+`--gpus all`; on hosts where SELinux is enforcing, such as Fedora, the
+container also needs SELinux labels turned off to open the GPU:
+
+```sh
+podman build -f docker/Dockerfile.cuda --build-arg CUDA_ARCHS="60;61" -t kinetic:cuda .
+podman run --rm --device nvidia.com/gpu=all --security-opt=label=disable \
+  -p 8080:8080 -v "$PWD/models:/models:ro" kinetic:cuda /models/model.gguf
 ```
 
 Inside the container the server listens on all interfaces, so that

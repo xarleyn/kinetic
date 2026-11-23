@@ -66,9 +66,29 @@ with `kinetic bench model.gguf --device cpu -t N`.
 
 ## NVIDIA GPUs
 
-GPUs from the Turing generation (RTX 20 series, GTX 16 series) on are
-supported, with kernels for compute capability 7.5, 8.0, 8.6, 8.9, 9.0 and
-12.0, and PTX that newer drivers compile for later GPUs.
+GPUs from the Pascal generation (GTX 10 series, Tesla P100) on are
+supported, with kernels for compute capability 6.0, 6.1, 7.0, 7.5, 8.0, 8.6,
+8.9, 9.0 and 12.0, and PTX that newer drivers compile for later GPUs.
+
+Pascal and Volta (compute capability 6.x and 7.0) have none of the tensor
+cores the prompt kernels use. Prompts run there in batches of up to 1024
+tokens through f32 matrix products of the quantized weights and f32
+attention in tiles of 64 queries, with the delta rule in chunks of 32
+tokens in f32 (and attention to heads of 64 taken 16 tokens at a time), so
+prompts take longer than on Turing and newer; generation runs the same
+kernels as on newer GPUs. On the Tesla P100 and V100 (6.0 and 7.0), whose
+f16 arithmetic runs at twice the f32 rate, the products multiply weights and
+inputs in pairs of f16 values and apply the scales in f32, about 1.5 times
+as fast; their results differ from the f32 products in the last bits, as a
+different order of summation would. Batches of 256 tokens or more expand
+each matrix to f16 once and multiply that, faster again, with the same
+results. The P100's attention tiles take queries, keys, weights and
+values in f16 pairs too, adding each run of terms in f32, which rounds them
+to about one part in a thousand. The Tesla P100 (6.0) also lacks the int8
+dot product instruction, which its kernels do in plain integer arithmetic,
+with the same results and less speed. The release binaries and `Dockerfile.cuda` build with CUDA 12
+and have kernels for them; a build from source with CUDA 13 does not, see
+[Building](building.md).
 
 Kinetic opens the driver library at runtime (`nvcuda.dll` on Windows,
 `libcuda.so.1` on Linux) and links nothing from the CUDA toolkit, so:
@@ -77,8 +97,8 @@ Kinetic opens the driver library at runtime (`nvcuda.dll` on Windows,
 - the `cuda` build starts on machines without a GPU and runs on the CPU.
 
 Use a recent driver; the kernels are built with CUDA 12.8, and `nvidia-smi`
-shows the highest CUDA version your driver supports in its header. Only the
-first GPU is used; two GPUs are [coming](roadmap.md).
+shows the highest CUDA version your driver supports in its header. The first
+GPU is used unless `--gpus` names others; see [Several GPUs](#several-gpus).
 
 ## Vulkan
 
@@ -87,6 +107,11 @@ NVIDIA. Today it runs `llama`, `qwen2`, `qwen3`, `lfm3` and `qwen35` models,
 with drafting and Warm Start; MoE models and the other architectures are
 [coming](roadmap.md). Under `auto`, Vulkan is tried after CUDA, so an NVIDIA
 GPU uses CUDA and an AMD or Intel GPU uses Vulkan.
+
+The Vulkan kernels need subgroups of 32. NVIDIA, Intel and AMD's RDNA GPUs
+have them; AMD's older GCN and Vega GPUs, among them the integrated graphics
+of many Ryzen APUs, only run subgroups of 64, which no driver changes, so
+models run on the CPU there and `kinetic doctor` says so.
 
 ## Dense models larger than the GPU
 
@@ -102,6 +127,56 @@ crosses between the two. The status line says how the model was split:
 `--gpu-layers N` puts at most `N` layers on the GPU, as llama.cpp's `-ngl N`
 does; use it to leave GPU memory for other programs. This works through
 CUDA; on Vulkan a model runs wholly on the GPU or on the CPU.
+
+## Several GPUs
+
+`--gpus 0,1` spreads a dense model's layers over CUDA GPUs 0 and 1 (in CUDA's
+order, which `kinetic doctor` lists): the first GPU holds the embeddings, the
+output head and the first run of layers, each further GPU the run after, each
+taking a share of the layers as large as its share of the free memory. Per
+token only the hidden state and its norm, a few kilobytes, cross from one GPU
+to the next and back to the first for the head, so the GPUs need no NVLink;
+where they have direct access to each other's memory it is used, otherwise
+the driver copies through system memory.
+
+```sh
+kinetic run model.gguf --gpus 0,1 "Explain this file."
+kinetic serve model.gguf --gpus 0,1
+kinetic bench model.gguf --gpus 0,1
+```
+
+The status line names each GPU with the number of layers it holds. The GPUs run one after the other, so a single answer is as fast as one GPU
+holding the whole model would make it: the gain is room. A model that would
+spill layers to the CPU on one GPU runs wholly on two, and the answer is the
+same, bit for bit, as on one GPU of the same kind. Layers that still do not
+fit run on the CPU, and `--gpu-layers` counts the layers over all GPUs.
+
+`kinetic doctor` numbers the CUDA GPUs and, with more than one, times the
+copies between each pair: a token-sized copy and a large one, through
+system memory and with direct access where the driver offers it.
+`kinetic fit --gpus 0,1` estimates where models go and how fast they run
+over those GPUs together.
+
+**If a model is much slower over several GPUs than on one,** direct access
+between them is the usual cause: on some hosts, often with an IOMMU or PCIe
+access control between the GPUs, the driver offers it but direct copies
+crawl or stall. `kinetic doctor` shows it, and `KINETIC_CUDA_P2P=0` turns
+direct access off so copies go through system memory, which costs a few
+microseconds a token. With it set, `kinetic doctor` leaves out the direct
+copies too, in case they stall:
+
+```sh
+KINETIC_CUDA_P2P=0 kinetic run model.gguf --gpus 0,1 "Hello"
+podman run -e KINETIC_CUDA_P2P=0 ...        # in a container
+```
+
+A model's own prediction block goes to the first GPU, with the embeddings
+and the output head, and drafts as on one GPU.
+
+For now, `--gpus` takes dense models without per-layer inputs or shared
+attention caches (not mixture-of-experts models or Gemma 4 E2B/E4B), and
+runs the requests of `--parallel` one after another rather than in shared
+passes.
 
 ## Memory
 
@@ -156,6 +231,7 @@ GPU too.
 
 - **More on Vulkan**: more architectures, speculative decoding, Warm Start
   and layer splits.
-- **Two GPUs.**
+- **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B and
+  shared passes; dense models already spread over them with `--gpus`.
 
 See the [roadmap](roadmap.md).

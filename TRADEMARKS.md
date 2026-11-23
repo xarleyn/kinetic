@@ -3,7 +3,17 @@
 Kinetic is open source under the Apache License 2.0. The license covers the
 code; it does not grant rights to the names and logos. "Kinetic", the Kinetic
 logo, "Velocity" and the Velocity logo are trademarks of Velocity
-(veloresearch.com). This policy says how you may use them.
+(veloresearch.com). So is "RAD-1", the name of Kinetic's speculative
+decoding. This policy says how you may use them.
+
+## Names of Kinetic's technologies
+
+RAD-1, Warm Start, Zero Wait, Shortlist, Torque, Burst, Convoy, Flywheel,
+Kinetic receipts and the `.ktc` format are the names Velocity gave to the
+parts of Kinetic that make it fast and exact. A fork keeps the code, and may
+keep the names for the same features as long as it says where they come
+from: "RAD-1 from Kinetic", "Warm Start, as in Kinetic". Do not present them
+as your own invention or as a technology of your project.
 
 ## Use freely
 
@@ -26,6 +36,9 @@ logo, "Velocity" and the Velocity logo are trademarks of Velocity
 
 - Calling a modified version "Kinetic". A fork or a changed build needs its
   own name; you may say it is "based on Kinetic".
+- Presenting Kinetic, or the technologies above, as your own work: in a
+  README, a paper, a report, a post or a benchmark, say that it is based on
+  Kinetic.
 - Suggesting that Velocity certifies, verifies or tunes models or builds it
   did not. In particular, do not describe a `.ktc` file as verified by Kinetic
   unless `kinetic verify` passes on it, and do not imply a signature by

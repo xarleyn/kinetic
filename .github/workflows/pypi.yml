@@ -16,6 +16,8 @@ permissions:
 
 jobs:
   publish:
+    # the nightly prerelease has no wheels and never goes to PyPI
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'nightly'
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:

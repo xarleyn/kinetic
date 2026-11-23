@@ -77,7 +77,7 @@ impl CudaDeltaNet {
     }
 
     pub fn new_state(&self, gpu: &Gpu) -> kinetic_cuda::Result<DeltaState> {
-        DeltaState::new(&gpu.ctx, &self.shape, MAX_BATCH)
+        DeltaState::new(&gpu.ctx, &gpu.stream, &self.shape, MAX_BATCH)
     }
 
     /// Needs for batches of up to `rows` tokens.

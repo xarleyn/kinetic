@@ -16,7 +16,9 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   the Vulkan kernels are written out as Metal shaders at build time and a
   Metal driver runs them (`--device metal`). Its GEMV kernels take a tile
   of four rows per invocation and their block sums in float, which is
-  faster on a Mac's GPU and changes no result. A `macos-arm64-metal`
+  faster on a Mac's GPU and changes no result. A prompt runs in passes of
+  up to 64 tokens, whose Q4_K, Q5_K and Q6_K matrices take kernels written for many
+  tokens that give every token the bits it gets alone. A `macos-arm64-metal`
   archive and a Python wheel are built for every release.
 - Built without the `metal` feature, the Vulkan backend also runs on a Mac
   through MoltenVK or KosmicKrisp: it opts into portability drivers, finds
@@ -42,6 +44,26 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
 
 - Vulkan: a recorded command graph kept resetting a timestamp query pool
   that had been destroyed with its recording. Drivers on Metal crashed on it.
+- CUDA: the state a recurrent layer builds for a new sequence zeroed its
+  ring and buffers on the legacy default stream, which no thread may touch
+  while a CUDA graph records; with two models on one device, one recording
+  a step and the other opening a sequence, the second failed with
+  CUDA_ERROR_STREAM_CAPTURE_IMPLICIT. The zeros are queued on the model's
+  own stream now, and a test builds recurrent state while a graph records.
+
+### Rust, C and Python API
+
+- `model.logits(prompt)` and `model.logits_chat(messages)` in the Rust
+  crate return the raw full-vocabulary logits of the next token, exactly
+  as plain decoding scores it, from the backend a request for them would
+  use, so they are the device's own; `model.n_vocab()` is how many values
+  they hold. The C API gains `kinetic_logits` and `kinetic_vocab_size`,
+  and Python `Model.logits` and `Model.n_vocab`.
+- `model.logits_rows(tokens)` returns the raw logits after every token of
+  a token sequence as one flat row-major buffer, one `n_vocab`-value row
+  per token, with token ids past the vocabulary rejected; Python returns
+  it as little-endian float32 bytes, so sequences can be scored token by
+  token as perplexity does.
 
 - Empty attention slot intersections no longer evaluate an unsigned subtraction
   before returning `None`, fixing six debug-mode attention/tree test failures.
@@ -65,6 +87,33 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   projector.
 - LFM2.5 mixture of experts (`lfm2moe`), experimental, on the CPU and CUDA,
   with experts kept in system memory when they do not fit the GPU.
+
+### Devices
+
+- NVIDIA Pascal (GTX 10 series, Tesla P100, sm_60 and sm_61) and Volta (sm_70)
+  through CUDA. Without the tensor cores the prompt kernels use, prompts run
+  in batches of up to 1024 tokens through f32 matrix products of the quantized
+  weights, in f16 pairs on the P100 and V100, and attention in tiles, in f16
+  pairs on the P100; generation runs the same kernels as on newer GPUs.
+  `KINETIC_CUDA_ARCHS` builds the kernels for chosen GPUs only.
+- Several CUDA GPUs: `--gpus 0,1` on `run`, `chat`, `serve` and `bench` spreads
+  a dense model's layers over them, with the same output as on one GPU.
+  A prediction block drafts from the first GPU. Mixture-of-experts models,
+  Gemma 4 E2B/E4B and shared passes stay on one GPU for now. `kinetic fit --gpus` estimates
+  for them, `kinetic doctor` times the copies between each pair of GPUs,
+  and `KINETIC_CUDA_P2P=0` turns off direct access between GPUs where it is
+  slower than going through memory.
+- `Dockerfile.cuda` takes `CUDA_ARCHS` to build for chosen GPUs only and
+  names its base images in full, so that Podman builds it without asking
+  for a registry; the install guide shows Podman with the NVIDIA Container
+  Toolkit's CDI devices.
+
+### Server
+
+- A tool call that starts while reasoning is still open ends the reasoning
+  and comes back as a tool call. Qwen3.5 with thinking on often writes
+  `<tool_call>` without closing `</think>` first; the call used to stay in
+  `reasoning_content` and the reply ended with `finish_reason: "stop"`.
 
 ## [0.1.0] - 2026-11-05
 

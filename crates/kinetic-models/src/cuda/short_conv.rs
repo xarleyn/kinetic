@@ -37,7 +37,7 @@ impl CudaShortConv {
     }
 
     pub fn new_state(&self, gpu: &Gpu) -> kinetic_cuda::Result<ConvState> {
-        ConvState::new(&gpu.ctx, self.channels(), self.taps, MAX_BATCH)
+        ConvState::new(&gpu.ctx, &gpu.stream, self.channels(), self.taps, MAX_BATCH)
     }
 
     pub fn needs(&self) -> Needs {

@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kinetic_cuda::MAX_BATCH;
-use kinetic_models::cuda::{
-    CudaModel, CudaRunner, CudaState, Placement, PREFILL_BATCH, PREFILL_GRID,
-};
+use kinetic_models::cuda::{CudaModel, CudaRunner, CudaState, Placement, PREFILL_GRID};
 use kinetic_models::speculative::{Decoder, Ensemble, Policy};
 use kinetic_models::warm::{Runner, Warm};
 use kinetic_models::{LoadError, Model, State};
@@ -31,6 +29,10 @@ pub struct CudaBackend<'a> {
     cached: Option<Sequence<CudaState>>,
     /// The length `cached` had when it began to run ahead of a request.
     ahead: Option<usize>,
+    /// Where the reply that ends `cached` starts to hold the sums of decode
+    /// steps, while it does: a point on the grid that the state is exact
+    /// up to, or comes back to; see [`CudaBackend::settle`].
+    unsettled: Option<usize>,
     warm: Option<Warm<'a>>,
     cpu: CpuBackend<'a>,
     device: String,
@@ -79,13 +81,31 @@ impl<'a> CudaBackend<'a> {
         context: usize,
         placement: Placement,
     ) -> Result<Self, LoadError> {
-        let name = kinetic_cuda::Device::get(0)
-            .and_then(|d| d.info())
-            .map_err(cuda_error)?
-            .name;
+        let ordinals = match placement.devices.as_slice() {
+            [] => vec![0],
+            d => d.to_vec(),
+        };
+        let names = ordinals
+            .iter()
+            .map(|&d| {
+                kinetic_cuda::Device::get(d)
+                    .and_then(|d| d.info())
+                    .map(|i| i.name)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(cuda_error)?;
         // slots on other threads share it, see the SAFETY note on Send
         #[allow(clippy::arc_with_non_send_sync)]
         let gpu = Arc::new(CudaModel::load_with(model, context, placement)?);
+        let name = match gpu.device_split().as_slice() {
+            [_] => names[0].clone(),
+            split => names
+                .iter()
+                .zip(split)
+                .map(|(name, n)| format!("{name} ({n} layers)"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+        };
         let device = match gpu.host_layers() {
             0 => name,
             host => format!(
@@ -107,6 +127,7 @@ impl<'a> CudaBackend<'a> {
                 tokens: Vec::new(),
             }),
             ahead: None,
+            unsettled: None,
             warm: None,
             cpu: CpuBackend::new(model),
             model,
@@ -137,8 +158,20 @@ impl<'a> CudaBackend<'a> {
     /// starts resume where a cold prefill cuts its batches, so they give
     /// exactly its output.
     pub fn with_warm(mut self, warm: Warm<'a>) -> Self {
-        self.warm = Some(warm.aligned(PREFILL_BATCH));
+        let batch = self.gpu.prefill_batch();
+        let batches = self.prefill_call() / batch;
+        self.warm = Some(warm.aligned(batch).batches_per_call(batches));
         self
+    }
+
+    /// Most prompt tokens to hand the model at once: several batches when
+    /// it is split over GPUs, which overlap them, and one batch otherwise,
+    /// so a model on one GPU cuts its prompts as it always has.
+    fn prefill_call(&self) -> usize {
+        match self.gpu.device_split().len() {
+            1 => self.gpu.prefill_batch(),
+            _ => self.gpu.prefill_call(),
+        }
     }
 
     /// Another backend on the same device and weights, with a sequence and
@@ -174,6 +207,7 @@ impl<'a> CudaBackend<'a> {
             device: self.device.clone(),
             max_draft: self.max_draft,
             ahead: None,
+            unsettled: None,
         })
     }
 
@@ -190,9 +224,12 @@ impl<'a> CudaBackend<'a> {
         prompt: &[u32],
         policy: &mut impl Policy<CudaModel<'a>>,
     ) -> (Sequence<CudaState>, usize, Option<Keep>) {
+        self.settle_for(prompt);
+        self.unsettled = None;
         self.rewind(prompt);
         // The batches a cold prefill runs before its last one.
-        let head = &prompt[..(prompt.len() - 1) / PREFILL_BATCH * PREFILL_BATCH];
+        let batch = self.gpu.prefill_batch();
+        let head = &prompt[..(prompt.len() - 1) / batch * batch];
         // The empty sequence made at load time leaves warm starts their go.
         let warm = self.warm.is_some() && !head.is_empty();
         let fresh = |s: &Sequence<CudaState>| s.tokens.is_empty() && warm;
@@ -252,11 +289,12 @@ impl<'a> CudaBackend<'a> {
         // a cold run cuts off its last tokens past the grid only when too
         // few for a batch of their own; see `PREFILL_GRID`
         let step = match rest % PREFILL_GRID {
-            0 => PREFILL_BATCH,
+            0 => self.gpu.prefill_batch(),
             _ => PREFILL_GRID,
         };
         let last = start + (rest - 1) / step * step;
-        for batch in prompt[start..last].chunks(PREFILL_BATCH) {
+        let call = self.prefill_call();
+        for batch in prompt[start..last].chunks(call) {
             self.decoder.feed(&*self.gpu, &mut seq.state, batch);
         }
         seq.tokens.extend_from_slice(&prompt[start..last]);
@@ -270,24 +308,76 @@ impl<'a> CudaBackend<'a> {
             policy,
             seq,
             prompt,
-            PREFILL_BATCH,
+            self.gpu.prefill_batch(),
         );
     }
 
-    /// Runs the reply in `seq` after a prompt of `prompt` tokens again as a
-    /// cold prompt runs it, from the mark [`CudaBackend::extend`] left up to
-    /// the last point on the grid, so that a longer prompt continues it
-    /// exactly: decode steps sum unlike prompt batches.
-    fn settle(&mut self, seq: &mut Sequence<CudaState>, prompt: usize) {
+    /// Runs the reply in `seq` again as a cold prompt runs it, from `from`,
+    /// the mark [`CudaBackend::extend`] left or a point an earlier call got
+    /// to, up to the last point on the grid, so that a longer prompt
+    /// continues it exactly: decode steps sum unlike prompt batches. With
+    /// `most`, runs only up to that many tokens further, and returns where
+    /// the reply is settled from on, if not yet to its end. Results do not
+    /// depend on where the grid cuts the reply.
+    fn settle(
+        &mut self,
+        seq: &mut Sequence<CudaState>,
+        from: usize,
+        most: Option<usize>,
+    ) -> Option<usize> {
         let Sequence { state, tokens } = seq;
-        let mark = (prompt - 1) / PREFILL_GRID * PREFILL_GRID;
-        let mark = device(self.gpu.truncate(self.model, state, mark));
-        let end = mark + (tokens.len() - mark) / PREFILL_GRID * PREFILL_GRID;
+        // only a state past `from` has the reply's decode steps to undo
+        let from = device(self.gpu.truncate(self.model, state, from));
+        let end = settled_end(from, tokens.len());
+        let to = most.map_or(end, |most| end.min(from + most));
         self.decoder.reset(&*self.gpu);
-        for batch in tokens[mark..end].chunks(PREFILL_BATCH) {
+        let call = self.prefill_call();
+        for batch in tokens[from..to].chunks(call) {
             self.decoder.feed(&*self.gpu, state, batch);
         }
+        if to < end {
+            return Some(to);
+        }
         tokens.truncate(end);
+        None
+    }
+
+    /// The tokens of the cached sequence that a request may continue: once
+    /// its reply is settled, those up to the last point on the grid.
+    fn settled_tokens(&self) -> &[u32] {
+        let Some(seq) = &self.cached else {
+            return &[];
+        };
+        match self.unsettled {
+            Some(from) => &seq.tokens[..settled_end(from, seq.tokens.len())],
+            None => &seq.tokens,
+        }
+    }
+
+    /// Settles the reply that ends the cached sequence, if it is not yet,
+    /// when `prompt` continues the sequence: the reply runs again only
+    /// before a request that goes on from it, not before the response ends.
+    /// A sequence that `prompt` leaves is cleared, since its reply could not
+    /// be continued exactly; one `prompt` stops short in waits for the next.
+    fn settle_for(&mut self, prompt: &[u32]) {
+        let Some(from) = self.unsettled else {
+            return;
+        };
+        let settled = self.settled_tokens();
+        let goes_on = prompt.starts_with(settled);
+        if !goes_on && settled.starts_with(prompt) {
+            return;
+        }
+        self.unsettled = None;
+        let mut seq = self.cached.take().expect("an unsettled sequence");
+        if goes_on {
+            self.settle(&mut seq, from, None);
+        } else {
+            self.decoder.reset(&*self.gpu);
+            device(self.gpu.reset_state(&mut seq.state));
+            seq.tokens.clear();
+        }
+        self.cached = Some(seq);
     }
 
     /// A new sequence run up to the end of `prompt` with the token after it
@@ -299,6 +389,7 @@ impl<'a> CudaBackend<'a> {
         policy: &mut impl Policy<CudaModel<'a>>,
     ) -> Sequence<CudaState> {
         self.decoder.reset(&*self.gpu);
+        self.unsettled = None;
         let old = self.cached.take().map(|s| s.state);
         let mut state = self.empty_state(old);
         let last = prompt.len() - 1;
@@ -354,7 +445,8 @@ impl<'a> CudaBackend<'a> {
     /// Takes the sequence a request for `prompt` would start from when it
     /// cannot continue the cached one: the longest warm prefix, or none.
     fn restart(&mut self, prompt: &[u32]) -> bool {
-        let head = &prompt[..(prompt.len() - 1) / PREFILL_BATCH * PREFILL_BATCH];
+        let batch = self.gpu.prefill_batch();
+        let head = &prompt[..(prompt.len() - 1) / batch * batch];
         if head.is_empty() {
             return false;
         }
@@ -380,6 +472,7 @@ impl<'a> CudaBackend<'a> {
     }
 
     fn ahead_of(&mut self, prompt: &[u32]) -> usize {
+        self.settle_for(prompt);
         self.rewind(prompt);
         let fresh = self.warm.is_some();
         let cached = self.cached.as_ref();
@@ -413,7 +506,7 @@ impl<'a> CudaBackend<'a> {
             &mut seq,
             base,
             prompt,
-            PREFILL_BATCH,
+            self.gpu.prefill_batch(),
             PREFILL_GRID,
         );
         if ran && grid.is_some_and(|g| (seq.tokens.len() - base).is_multiple_of(g)) {
@@ -423,6 +516,16 @@ impl<'a> CudaBackend<'a> {
         self.cached = Some(seq);
         len
     }
+}
+
+/// The most tokens of a reply [`Backend::settle_some`] runs again at once,
+/// which a request that comes meanwhile waits for.
+const SETTLE_PIECE: usize = 2 * PREFILL_GRID;
+
+/// Where settling a reply that a sequence of `len` tokens ends, from `mark`
+/// on, leaves the sequence: at the last point on the grid.
+fn settled_end(mark: usize, len: usize) -> usize {
+    mark + (len - mark) / PREFILL_GRID * PREFILL_GRID
 }
 
 fn device<T>(r: kinetic_cuda::Result<T>) -> T {
@@ -449,7 +552,6 @@ impl<'a> Run<CudaModel<'a>> for CudaBackend<'a> {
         let generated =
             sequence::decode(&*self.gpu, &mut self.decoder, policy, &mut seq, job, emit);
         let decode = start.elapsed();
-        self.settle(&mut seq, prompt.len());
         if let (Some(warm), Some(k)) = (self.warm.as_mut(), keep) {
             // The state is kept in memory either way; a failed disk write
             // only means the next run starts colder.
@@ -457,6 +559,10 @@ impl<'a> Run<CudaModel<'a>> for CudaBackend<'a> {
         }
         // placeholder tokens do not tell images apart
         self.cached = job.images.is_empty().then_some(seq);
+        // settled when a request goes on from it, which spares the others,
+        // or while the backend is idle
+        let mark = (prompt.len() - 1) / PREFILL_GRID * PREFILL_GRID;
+        self.unsettled = self.cached.is_some().then_some(mark);
         self.ahead = None;
         Timings {
             prompt_tokens: prompt.len(),
@@ -486,16 +592,41 @@ impl Backend for CudaBackend<'_> {
         sequence::generate(self, prompt, job, &mut |t| seat.away(|| emit(t)))
     }
 
+    fn logits(&mut self, tokens: &[u32], all_rows: bool) -> Result<Vec<f32>, String> {
+        let gpu = Arc::clone(&self.gpu);
+        let _seat = gpu.seat();
+        let mut state = gpu.new_state().map_err(|e| format!("CUDA: {e}"))?;
+        gpu.run(&mut state, tokens, all_rows)
+            .map(|f| f.logits)
+            .map_err(|e| format!("CUDA: {e}"))
+    }
+
     fn reuses(&self, prompt: &[u32]) -> usize {
-        self.cached
-            .as_ref()
-            .filter(|s| s.continues(prompt) && !s.tokens.is_empty())
-            .map_or(0, |s| s.tokens.len())
+        let tokens = self.settled_tokens();
+        match prompt.len() > tokens.len() && prompt.starts_with(tokens) {
+            true => tokens.len(),
+            false => 0,
+        }
     }
 
     fn run_ahead(&mut self, prompt: &[u32]) -> usize {
         let gpu = Arc::clone(&self.gpu);
         let _seat = gpu.seat();
         self.ahead_of(prompt)
+    }
+
+    fn unsettled(&self) -> bool {
+        self.unsettled.is_some()
+    }
+
+    fn settle_some(&mut self) {
+        let Some(from) = self.unsettled.take() else {
+            return;
+        };
+        let mut seq = self.cached.take().expect("an unsettled sequence");
+        let gpu = Arc::clone(&self.gpu);
+        let _seat = gpu.seat();
+        self.unsettled = self.settle(&mut seq, from, Some(SETTLE_PIECE));
+        self.cached = Some(seq);
     }
 }

@@ -142,6 +142,9 @@ fn check_large_batch(ty: TensorType, rows: usize, cols: usize, n: usize) {
     let y = y.to_vec().unwrap();
 
     let xe = effective_input(ty, &x, &input);
+    // f16 pairs round each weight and short sums
+    let half = gpu.kernels.half_products() && !matches!(ty, TensorType::F16 | TensorType::F32);
+    let tolerance = if half { 2e-3 } else { 1e-5 };
     let mut row = vec![0.0; cols];
     for r in 0..rows {
         dequantize(ty, m.row(r), &mut row).unwrap();
@@ -155,7 +158,7 @@ fn check_large_batch(ty: TensorType, rows: usize, cols: usize, n: usize) {
                 .sum();
             let got = y[i * rows + r] as f64;
             assert!(
-                (got - exact).abs() <= 1e-5 * magnitude + 1e-6,
+                (got - exact).abs() <= tolerance * magnitude + 1e-6,
                 "{ty} row {r} input {i}: got {got}, expected {exact}"
             );
         }
@@ -185,6 +188,54 @@ fn large_batches_match_reference() {
     check_large_batch(TensorType::Q4K, 100, 5 * 256, 20);
     check_large_batch(TensorType::Q6K, 100, 5 * 256, 40);
     check_large_batch(TensorType::PQ2_0, 100, 5 * 256, 20);
+}
+
+/// Without tensor cores, in f16 pairs, a batch of 256 inputs or more expands
+/// its weights to f16 once and multiplies those, in pieces of the rows where
+/// the buffer is short; its outputs must have the bits of smaller batches,
+/// which expand the weights in every tile.
+#[test]
+fn unpacked_products_keep_the_bits() {
+    let Some(gpu) = gpu() else { return };
+    // 200 rows and 300 inputs leave both tile edges partly empty.
+    let (rows, cols, n) = (200, 5 * 256, 300);
+    for ty in [
+        TensorType::Q4K,
+        TensorType::Q5K,
+        TensorType::Q6K,
+        TensorType::Q8_0,
+        TensorType::Q4_0,
+        TensorType::PQ2_0,
+    ] {
+        let mut rng = Lcg(ty as u64 + 300);
+        let data = random_matrix(ty, rows, cols, &mut rng);
+        let w = DeviceMatrix::upload(&gpu.ctx, &Matrix::new(ty, &data, rows, cols)).unwrap();
+        let x: Vec<f32> = (0..n * cols).map(|_| rng.f32() * 3.0).collect();
+        let mut input = GemvInput::batch(&gpu.ctx, cols, n).unwrap();
+        input.upload(&gpu.kernels, &x, &gpu.stream).unwrap();
+        let run = |inputs: std::ops::Range<usize>| {
+            let mut y = DeviceBuffer::new(&gpu.ctx, inputs.len() * rows).unwrap();
+            gpu.kernels
+                .gemv_rows(&w, rows, &input, inputs, &mut y, &gpu.stream)
+                .unwrap();
+            y.to_vec().unwrap()
+        };
+        let whole = run(0..n);
+        let parts: Vec<f32> = (0..n).step_by(100).flat_map(|i| run(i..i + 100)).collect();
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert!(
+            bits(&whole) == bits(&parts),
+            "{ty}: a large batch changes bits"
+        );
+        // room for 128 rows, as when memory is short: pieces of 128 and 72
+        gpu.kernels.limit_unpacked(128 * cols);
+        let pieces = run(0..n);
+        gpu.kernels.limit_unpacked(usize::MAX);
+        assert!(
+            bits(&pieces) == bits(&parts),
+            "{ty}: pieces of the rows change bits"
+        );
+    }
 }
 
 // 37 rows leave the last thread block partly empty; 5 K-quant blocks per row
@@ -257,6 +308,10 @@ fn gated_product_matches_separate_products() {
         let ran = k
             .glu_matmul(&gate, &up, gelu, &input, 0..n, &mut fused, &gpu.stream)
             .unwrap();
+        if !ran && !gpu.ctx.device().info().unwrap().tensor_cores() {
+            eprintln!("skipped: the device has no tiled products");
+            return;
+        }
         assert!(ran, "{ty}: no gated product kernel");
 
         let mut g = DeviceBuffer::new(&gpu.ctx, n * rows).unwrap();

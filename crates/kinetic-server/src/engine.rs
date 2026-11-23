@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use kinetic_gguf::Gguf;
 use kinetic_grammar::{Grammar, Vocabulary};
@@ -12,6 +13,7 @@ use kinetic_vision::VisionEncoder;
 use serde_json::{Map, Value};
 
 use crate::backend::{Backend, Job, PromptImage, Timings};
+use crate::logprobs::TextLogprobs;
 use crate::metrics::{Load, Slot, Stats};
 use crate::model_info::ModelInfo;
 use crate::receipt::Receipts;
@@ -35,6 +37,10 @@ const END_OF_TURN: &[&str] = &[
 
 /// Stands in for the rest of a message being written, to find where it
 /// goes in the rendered template.
+/// How long the backends sit idle before [`Engine::settle_while_idle`]
+/// settles them.
+const SETTLE_AFTER: Duration = Duration::from_millis(250);
+
 const DRAFT_END: &str = "\u{F8FF}";
 
 /// The token chat templates write where an image goes, and the tokens the
@@ -316,14 +322,24 @@ impl<'a> Engine<'a> {
 
     fn on_free<T>(
         &self,
-        mut free: MutexGuard<'_, Vec<(usize, Box<dyn Backend + 'a>)>>,
+        free: MutexGuard<'_, Vec<(usize, Box<dyn Backend + 'a>)>>,
         prompt: &[u32],
         f: impl FnOnce(usize, &mut dyn Backend) -> T,
     ) -> T {
         let best = (0..free.len())
             .max_by_key(|&i| free[i].1.reuses(prompt))
             .expect("a free backend");
-        let backend = free.swap_remove(best);
+        self.on_free_at(free, best, f)
+    }
+
+    /// Runs `f` on free backend `i` of `free`.
+    fn on_free_at<T>(
+        &self,
+        mut free: MutexGuard<'_, Vec<(usize, Box<dyn Backend + 'a>)>>,
+        i: usize,
+        f: impl FnOnce(usize, &mut dyn Backend) -> T,
+    ) -> T {
+        let backend = free.swap_remove(i);
         drop(free);
         // Returns the backend even when `f` panics, as a lost client does
         // not take a slot with it.
@@ -338,6 +354,48 @@ impl<'a> Engine<'a> {
         let mut back = Back(self, Some(backend));
         let (id, backend) = back.1.as_mut().expect("the backend");
         f(*id, backend.as_mut())
+    }
+
+    /// Settles idle backends until `live` turns false: once the backends
+    /// have sat idle for [`SETTLE_AFTER`], each that [`Backend::unsettled`]
+    /// runs [`Backend::settle_some`] in turn while no request waits for a
+    /// backend. A request that comes straight after a response, as a
+    /// client's next one in a loop does, finds things as without this.
+    pub fn settle_while_idle(&self, live: impl Fn() -> bool) {
+        let mut free = self.lock_free();
+        while live() {
+            if !free.iter().any(|(_, b)| b.unsettled()) {
+                free = self
+                    .freed
+                    .wait(free)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            // a backend taken or given back meanwhile starts the wait over
+            let (again, wait) = self
+                .freed
+                .wait_timeout(free, SETTLE_AFTER)
+                .unwrap_or_else(PoisonError::into_inner);
+            free = again;
+            if !wait.timed_out() {
+                continue;
+            }
+            while live() && self.waiting.load(Ordering::SeqCst) == 0 {
+                let Some(i) = free.iter().position(|(_, b)| b.unsettled()) else {
+                    break;
+                };
+                self.on_free_at(free, i, |_, b| b.settle_some());
+                free = self.lock_free();
+            }
+        }
+    }
+
+    /// Wakes [`Engine::settle_while_idle`] to look at `live` again.
+    pub fn wake(&self) {
+        // under the lock, so the wakeup cannot fall between its look at
+        // `live` and its wait
+        let _free = self.lock_free();
+        self.freed.notify_all();
     }
 
     /// Lets prompts carry images, which `encoder` turns into rows of the
@@ -473,14 +531,38 @@ impl<'a> Engine<'a> {
         self.complete_tokens(ids, prompt, request, logprobs, on_delta)
     }
 
+    /// Chat uses the same visible token prefix for logprobs in both modes.
+    pub(crate) fn complete_chat_with_logprobs(
+        &self,
+        prompt: &Prompt,
+        request: &Request,
+        logprobs: Option<&Logprobs>,
+        on_delta: &mut dyn FnMut(&Split, usize) -> bool,
+    ) -> Result<Completion, RequestError> {
+        let ids = self.encode(&prompt.text);
+        self.complete_tokens_inner(ids, prompt, request, logprobs, true, on_delta)
+    }
+
     /// [`Engine::complete_with_logprobs`] after prompt tokens already
     /// encoded; `prompt` only gives the images, reasoning and tools.
     pub fn complete_tokens(
+        &self,
+        ids: Vec<u32>,
+        prompt: &Prompt,
+        request: &Request,
+        logprobs: Option<&Logprobs>,
+        on_delta: &mut dyn FnMut(&Split, usize) -> bool,
+    ) -> Result<Completion, RequestError> {
+        self.complete_tokens_inner(ids, prompt, request, logprobs, false, on_delta)
+    }
+
+    fn complete_tokens_inner(
         &self,
         mut ids: Vec<u32>,
         prompt: &Prompt,
         request: &Request,
         logprobs: Option<&Logprobs>,
+        visible_logprobs: bool,
         on_delta: &mut dyn FnMut(&Split, usize) -> bool,
     ) -> Result<Completion, RequestError> {
         if ids.is_empty() {
@@ -499,7 +581,10 @@ impl<'a> Engine<'a> {
 
         let mut decoder = self.tokenizer.stream();
         let mut stops = StopStrings::new(&request.stop);
-        let mut think = prompt.thinking.map(ThinkSplitter::new);
+        let mut think = prompt.thinking.map(|open| match prompt.tools.is_empty() {
+            true => ThinkSplitter::new(open),
+            false => ThinkSplitter::new(open).with_calls(),
+        });
         let mut tools = (!prompt.tools.is_empty()).then(ToolSplitter::new);
         let calls = |mut part: Split, tools: &mut Option<ToolSplitter>| {
             if let Some(t) = tools.as_mut() {
@@ -522,10 +607,12 @@ impl<'a> Engine<'a> {
         let mut cut = false;
         let mut generated = 0;
         let mut output_ids = Vec::new();
-        let mut deliver = |part: Split, generated: usize, out: &mut Split| {
+        let mut text_logprobs =
+            (visible_logprobs && logprobs.is_some()).then(TextLogprobs::default);
+        let mut deliver = |part: Split, count: usize, out: &mut Split| {
             out.reasoning.push_str(&part.reasoning);
             out.content.push_str(&part.content);
-            part.is_empty() || on_delta(&part, generated)
+            part.is_empty() || on_delta(&part, count)
         };
 
         let vocab = request.grammar.as_ref().map(|_| {
@@ -542,6 +629,7 @@ impl<'a> Engine<'a> {
             images: &images,
             logprobs,
         };
+        let mut count = 0;
         let timings = self.on_backend(&ids, |slot, backend| {
             self.stats
                 .start(slot, request, prompt.text.clone(), max_tokens);
@@ -556,7 +644,11 @@ impl<'a> Engine<'a> {
                         return false;
                     }
                     let (text, hit) = stops.push(&decoder.push(t));
-                    let open = deliver(split(&text), generated, &mut out);
+                    count = text_logprobs.as_mut().map_or(generated, |log| {
+                        log.push(self.tokenizer.piece(t));
+                        log.emit(&text)
+                    });
+                    let open = deliver(split(&text), count, &mut out);
                     if hit {
                         (finish, cut) = (Finish::Stop, true);
                         return false;
@@ -576,11 +668,15 @@ impl<'a> Engine<'a> {
 
         if !cut {
             // the decoder holds back only an unfinished character, e.g. one cut by the token limit; drop it
-            deliver(split(&stops.finish()), generated, &mut out);
+            let text = stops.finish();
+            count = text_logprobs
+                .as_mut()
+                .map_or(generated, |log| log.emit(&text));
+            deliver(split(&text), count, &mut out);
         }
         if let Some(t) = think.as_mut() {
             let part = calls(t.finish(), &mut tools);
-            deliver(part, generated, &mut out);
+            deliver(part, count, &mut out);
         }
         let tool_calls = match tools {
             Some(t) => {
@@ -589,11 +685,14 @@ impl<'a> Engine<'a> {
                     content,
                     ..Split::default()
                 };
-                deliver(part, generated, &mut out);
+                deliver(part, count, &mut out);
                 found
             }
             None => Vec::new(),
         };
+        if let (Some(_), Some(log)) = (text_logprobs, logprobs) {
+            log.truncate(count);
+        }
         out.reasoning.truncate(out.reasoning.trim_end().len());
         if !tool_calls.is_empty() {
             out.content.truncate(out.content.trim_end().len());
@@ -638,6 +737,27 @@ impl Engine<'_> {
             .ok_or_else(|| RequestError("the chat template dropped the draft".into()))?;
         prompt.text.truncate(end);
         Ok(prompt)
+    }
+
+    /// The model's raw logits after `tokens`, before any sampler, from
+    /// the backend a request for them would use, so they are that device's
+    /// own scores: the row after the last token, or with `all_rows` one
+    /// row per token, `n_vocab` values apiece. `tokens` runs on a fresh
+    /// state, which gives the same bits a request's batches give and
+    /// changes nothing else of the engine.
+    pub fn logits(&self, tokens: &[u32], all_rows: bool) -> Result<Vec<f32>, RequestError> {
+        if tokens.is_empty() {
+            return Err(RequestError("the tokens are empty".into()));
+        }
+        if tokens.len() > self.context_length {
+            return Err(RequestError(format!(
+                "the tokens are {} long, over the {}-token context",
+                tokens.len(),
+                self.context_length
+            )));
+        }
+        self.on_backend(tokens, |_, backend| backend.logits(tokens, all_rows))
+            .map_err(RequestError)
     }
 
     /// Zero Wait: runs `prompt`, the start of a request still being

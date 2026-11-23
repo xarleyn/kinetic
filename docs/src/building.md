@@ -41,10 +41,21 @@ to a compatible `cl.exe` or its directory before building. For example, a
 CUDA 12.4 build can select an installed Visual Studio 2022 toolset instead
 of Visual Studio 2026. This setting affects only the CUDA host compiler.
 
-The build queries `nvcc --list-gpu-code` and includes the supported targets
-from Turing (sm_75) to Blackwell (sm_120), warning about targets the installed
+The build queries `nvcc --list-gpu-code` and includes supported targets from
+Pascal (sm_60) to Blackwell (sm_120), warning about targets the installed
 toolkit cannot build. PTX for compute_90 and compute_120 is included when
 those targets are supported, for newer drivers to compile for later GPUs.
+`KINETIC_CUDA_ARCHS` builds for chosen compute capabilities only, which is
+much faster, with PTX for the last of them:
+
+```sh
+KINETIC_CUDA_ARCHS="60;61" cargo build --release -p kinetic-cli --features cuda
+```
+
+Pascal and Volta (sm_60 to sm_70) need CUDA 12: CUDA 13 no longer builds
+for them, so with CUDA 13 the build leaves them out and says so in a
+warning, and a binary built that way reports on those GPUs that it has no
+kernels for them.
 
 Install the binary into `~/.cargo/bin`:
 

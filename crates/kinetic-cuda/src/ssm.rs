@@ -109,13 +109,13 @@ pub struct SsmState {
 impl SsmState {
     /// A zero state that records up to [`MAX_BATCH`] tokens between a
     /// checkpoint and its rollback.
-    pub fn new(ctx: &Rc<Context>, shape: &SsmShape) -> Result<SsmState> {
+    pub fn new(ctx: &Rc<Context>, stream: &Stream, shape: &SsmShape) -> Result<SsmState> {
         shape.check()?;
         let ring_len = shape.conv_taps - 1 + MAX_BATCH;
         let mut ring = DeviceBuffer::new(ctx, ring_len * shape.channels())?;
         let mut state = DeviceBuffer::new(ctx, shape.state_len())?;
-        ring.zero()?;
-        state.zero()?;
+        ring.zero_on(stream)?;
+        state.zero_on(stream)?;
         Ok(SsmState {
             ring,
             journal: DeviceBuffer::new(ctx, MAX_BATCH * shape.journal_stride())?,

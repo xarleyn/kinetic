@@ -1,6 +1,11 @@
 Kinetic
 Copyright 2026 Velocity
 
+Kinetic is written by Velocity (https://github.com/Veloresearch/kinetic),
+including its RAD-1, Warm Start, Zero Wait, Shortlist, Torque, Burst,
+Convoy and Flywheel, its receipts and the .ktc format. Works based on
+Kinetic keep this notice, as the Apache License 2.0 asks.
+
 This product includes material from third parties:
 
 crates/kinetic-grammar/tests/data/llama.cpp

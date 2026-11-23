@@ -32,6 +32,11 @@ const FLASH_PAD: usize = 8;
 
 /// Head sizes the flash kernel handles.
 pub(crate) const FLASH_HEADS: [usize; 4] = [64, 128, 256, 512];
+/// Queries and threads per block of the f32 tile kernel, and the head sizes
+/// it handles; must match attention_tile.cuh.
+const TILE_QUERIES: u32 = 64;
+const TILE_THREADS: u32 = 256;
+const TILE_HEADS: [usize; 3] = [128, 256, 512];
 
 /// Value dims of one flash block: heads of 512 split their outputs over two.
 fn flash_values(hd: usize) -> usize {
@@ -432,11 +437,14 @@ impl Kernels {
     /// each query over its causal (and windowed) past and writes the gated
     /// result to `io.out`.
     ///
-    /// Batches of more than [`MAX_BATCH`] tokens run flash-style on tensor
-    /// cores without scratch, as accurate as f32 arithmetic but summed in
-    /// another order, so their results differ slightly from smaller batches.
-    /// They need [`Kernels::large_batches`]. A windowed cache must hold the
-    /// window and the batch.
+    /// Batches of more than [`MAX_BATCH`] tokens run flash-style without
+    /// scratch, on tensor cores as accurate as f32 arithmetic and without
+    /// them in f32, but summed in another order, so their results differ
+    /// slightly from smaller batches. Without tensor cores, heads of 64
+    /// store every key and value first, then attend [`MAX_BATCH`] queries at
+    /// a time, with the scratch and results of smaller batches. They need
+    /// [`Kernels::large_batches`]. A windowed
+    /// cache must hold the window and the batch.
     pub fn attention(
         &self,
         params: AttentionParams,
@@ -500,17 +508,22 @@ impl Kernels {
                 )));
             }
         }
-        let flash = n > MAX_BATCH;
+        let flash = n > MAX_BATCH && self.attn_flash.is_some();
+        let tile = (n > MAX_BATCH && TILE_HEADS.contains(&hd))
+            .then_some(self.attn_tile.as_ref())
+            .flatten();
         let stored_heads = if params.store { s.n_head_kv as u32 } else { 0 };
-        if !flash {
-            io.scratch
-                .check_holds(s.scratch_len(n, cache.slots), "attention scratch")?;
+        if !flash && tile.is_none() {
+            io.scratch.check_holds(
+                s.scratch_len(n.min(MAX_BATCH), cache.slots),
+                "attention scratch",
+            )?;
         }
         io.out.check_rows(n)?;
 
         let max_chunks = s.max_chunks(cache.slots);
         let ((k_cache, k_scale), (v_cache, v_scale)) = (cache.k.ptrs(), cache.v.ptrs());
-        let args = AttnArgs {
+        let mut args = AttnArgs {
             batch: batch.device_ptr(),
             q: io.q.device_ptr(),
             k: io.k.device_ptr(),
@@ -591,28 +604,56 @@ impl Kernels {
                 flash.launch(config, stream, &mut [arg(&args), arg(&n)])?;
                 return io.out.quantize(self, n as usize, stream);
             }
+            if let Some(tile) = tile {
+                let values = if hd == 512 { 256 } else { hd };
+                let config = LaunchConfig {
+                    grid: [n.div_ceil(TILE_QUERIES), heads, (hd / values) as u32],
+                    block: [TILE_THREADS, 1, 1],
+                    shared_bytes: 0,
+                };
+                tile.launch(config, stream, &mut [arg(&args), arg(&n)])?;
+                return io.out.quantize(self, n as usize, stream);
+            }
             // perf: two query heads of a KV group per block measured best,
             // ~15% over one at 32k positions on an RTX 3060 Laptop
             let pair = (s.n_head / s.n_head_kv).is_multiple_of(2);
             let chunks = (max_chunks as u32).div_ceil(CHUNK_WARPS).min(CHUNK_BLOCKS);
-            launch_struct(
-                &self.attn_chunk[usize::from(pair)],
-                grid(
-                    [n * heads / (1 + u32::from(pair)), chunks, 1],
-                    32 * CHUNK_WARPS,
-                ),
-                stream,
-                &args,
-            )?;
-            launch_struct(
-                &self.attn_combine,
-                grid(
-                    [n * heads, (hd / COMBINE_THREADS) as u32, 1],
-                    COMBINE_THREADS as u32,
-                ),
-                stream,
-                &args,
-            )
+            // Every key and value is stored; each step of queries attends as
+            // a batch of its own would, sharing the scratch.
+            let (q, gate, out, grid_at) = (args.q, args.head_gate, args.out, args.grid);
+            for first in (0..n as usize).step_by(MAX_BATCH) {
+                let m = (n as usize - first).min(MAX_BATCH) as u32;
+                if first > 0 {
+                    args.batch = batch.step_ptr(first);
+                    args.q = q + 4 * (first * s.q_len()) as u64;
+                    if gate != 0 {
+                        args.head_gate = gate + 4 * (first * s.n_head) as u64;
+                    }
+                    args.out = out.skip_inputs(first, width);
+                    if grid_at != 0 {
+                        args.grid = grid_at + 12 * first as u64;
+                    }
+                }
+                launch_struct(
+                    &self.attn_chunk[usize::from(pair)],
+                    grid(
+                        [m * heads / (1 + u32::from(pair)), chunks, 1],
+                        32 * CHUNK_WARPS,
+                    ),
+                    stream,
+                    &args,
+                )?;
+                launch_struct(
+                    &self.attn_combine,
+                    grid(
+                        [m * heads, (hd / COMBINE_THREADS) as u32, 1],
+                        COMBINE_THREADS as u32,
+                    ),
+                    stream,
+                    &args,
+                )?;
+            }
+            Ok(())
         }
     }
 }

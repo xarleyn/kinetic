@@ -4,7 +4,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
@@ -41,12 +41,18 @@ pub fn serve(engine: &Engine, listener: TcpListener) {
 
 /// [`serve`] with `options`.
 pub fn serve_with(engine: &Engine, listener: TcpListener, options: &Options) {
-    serve_routes(
-        listener,
-        options,
-        Protocol::Generation,
-        &|head, body, out| route(engine, head, body, out),
-    );
+    let serving = AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        scope.spawn(|| engine.settle_while_idle(|| serving.load(Ordering::Acquire)));
+        serve_routes(
+            listener,
+            options,
+            Protocol::Generation,
+            &|head, body, out| route(engine, head, body, out),
+        );
+        serving.store(false, Ordering::Release);
+        engine.wake();
+    });
 }
 
 /// Serves `/v1/embeddings` for an embedding model, or `/v1/rerank` for a
@@ -379,7 +385,7 @@ fn chat(engine: &Engine, req: ChatRequest, out: &mut impl Write) -> Result<(), A
     };
     if !req.common.stream() {
         let c = engine
-            .complete_with_logprobs(&prompt, &request, log.as_ref(), &mut |_, _| true)
+            .complete_chat_with_logprobs(&prompt, &request, log.as_ref(), &mut |_, _| true)
             .map_err(invalid)?;
         let ids = call_ids(&c);
         let mut body = api::chat_response(&meta, &c, &ids);
@@ -398,9 +404,9 @@ fn chat(engine: &Engine, req: ChatRequest, out: &mut impl Write) -> Result<(), A
     let mut events = Events::new(out, Some(first));
     let mut sent = 0;
     let c = engine
-        .complete_with_logprobs(&prompt, &request, log.as_ref(), &mut |part, generated| {
+        .complete_chat_with_logprobs(&prompt, &request, log.as_ref(), &mut |part, count| {
             let mut lp = log.as_ref().map(|log| {
-                let tokens = log.range(sent, generated);
+                let tokens = log.range(sent, count);
                 sent += tokens.len();
                 logprobs::chat(&tokens, piece)
             });

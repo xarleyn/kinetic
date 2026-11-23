@@ -191,6 +191,23 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         })
     }
 
+    /// Queues setting every byte to zero on `stream`.
+    ///
+    /// The synchronous [`zero`](DeviceBuffer::zero) runs on the legacy
+    /// default stream, which no thread may use while any stream records a
+    /// CUDA graph, so state built while another sequence records uses
+    /// this instead.
+    pub fn zero_on(&mut self, stream: &Stream) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let api = self.ctx.enter()?;
+        // SAFETY: the buffer holds `bytes()` bytes.
+        api.check("cuMemsetD8Async", unsafe {
+            (api.memset_d8_async)(self.ptr, 0, self.bytes(), stream.raw())
+        })
+    }
+
     /// Queues setting elements `..len` to zero on `stream`.
     pub(crate) fn zero_prefix(&mut self, len: usize, stream: &Stream) -> Result<()> {
         self.check_holds(len, "zeroed range")?;
@@ -263,7 +280,8 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     }
 
     /// Queues a copy of elements `range` of `src` into this buffer from
-    /// element `start` on `stream`.
+    /// element `start` on `stream`. `src` may live in another context, on
+    /// another device: the copy then goes between them as a peer copy.
     pub fn copy_from_device(
         &mut self,
         start: usize,
@@ -276,6 +294,23 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if range.is_empty() {
             return Ok(());
         }
+        let bytes = range.len() * size_of::<T>();
+        if !Rc::ptr_eq(&self.ctx, &src.ctx) {
+            // Unified addressing tells the driver which device each address
+            // is on; unlike cuMemcpyPeerAsync this copy can be captured into
+            // a graph.
+            let api = stream.context().enter()?;
+            // SAFETY: both ranges lie inside their buffers, and the driver
+            // waits for queued work before freeing either.
+            return api.check("cuMemcpyAsync", unsafe {
+                (api.memcpy_async)(
+                    self.ptr_at(start),
+                    src.ptr_at(range.start),
+                    bytes,
+                    stream.raw(),
+                )
+            });
+        }
         let api = self.ctx.enter()?;
         // SAFETY: both ranges lie inside their buffers, and the driver
         // waits for queued work before freeing either.
@@ -283,7 +318,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             (api.memcpy_dtod_async)(
                 self.ptr_at(start),
                 src.ptr_at(range.start),
-                range.len() * size_of::<T>(),
+                bytes,
                 stream.raw(),
             )
         })

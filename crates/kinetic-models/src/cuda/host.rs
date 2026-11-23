@@ -163,9 +163,7 @@ impl CudaModel<'_> {
         host.pos = state.pos;
         host.layers[..self.front].clone_from_slice(&state.work.front);
         for ((layer, ls), hs) in self
-            .layers
-            .iter()
-            .zip(&state.work.layers)
+            .layer_states(&state.work)
             .zip(&mut host.layers[self.front..])
         {
             let bufs = layer.mixer.save(ls, state.pos)?;
@@ -194,10 +192,8 @@ impl CudaModel<'_> {
         dev.pos = state.pos;
         dev.checkpoint = None;
         dev.work.front = state.layers[..self.front].to_vec();
-        for ((layer, ls), hs) in self
-            .layers
-            .iter()
-            .zip(&mut dev.work.layers)
+        for ((_, layer, ls), hs) in self
+            .device_layers(&mut dev.work)
             .zip(&state.layers[self.front..])
         {
             layer.mixer.load(ls, state.pos, &hs.buffers())?;
@@ -207,8 +203,8 @@ impl CudaModel<'_> {
     }
 
     /// Empties `dev`, a state of this model, for a new sequence in the same
-    /// buffers: recurrent layers are zeroed on the device, caches simply
-    /// start over.
+    /// buffers: recurrent layers are zeroed on the device, the layers on the
+    /// host start afresh, caches simply start over.
     pub fn reset_state(&self, dev: &mut CudaState) -> kinetic_cuda::Result<()> {
         if dev.pos == 0 && dev.checkpoint.is_none() {
             return Ok(());
@@ -217,11 +213,9 @@ impl CudaModel<'_> {
         dev.checkpoint = None;
         dev.marks.clear();
         dev.work.batch.set_grid_shift(0);
-        let stream = &self.gpu.stream;
-        dev.work
-            .layers
-            .iter_mut()
-            .try_for_each(|s| clear_layer(s, stream))
+        dev.work.front = self.new_front();
+        self.device_layers(&mut dev.work)
+            .try_for_each(|(gpu, _, s)| clear_layer(s, &gpu.stream))
     }
 
     /// Cuts `state` back to `len` tokens on the device as [`Model::truncate`]
@@ -265,7 +259,9 @@ impl CudaModel<'_> {
                 None => host.mixer.truncate(ls, to),
             }
         }
-        for (i, (layer, ls)) in self.layers.iter().zip(&mut state.work.layers).enumerate() {
+        let marks = &state.marks;
+        let saved = |i: usize| mark.and_then(|m| marks[m].layers[i].as_ref());
+        for (i, (_, layer, ls)) in self.device_layers(&mut state.work).enumerate() {
             if let Some(s) = saved(self.front + i) {
                 layer.mixer.load(ls, to, &s.buffers())?;
             }
@@ -287,9 +283,7 @@ impl CudaModel<'_> {
             .map(|(host, ls)| host.mixer.needs_mark().then(|| ls.clone()))
             .collect();
         for ((layer, ls), host) in self
-            .layers
-            .iter()
-            .zip(&state.work.layers)
+            .layer_states(&state.work)
             .zip(&model.layers[self.front..])
         {
             layers.push(match host.mixer.needs_mark() {

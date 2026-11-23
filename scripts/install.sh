@@ -11,6 +11,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Veloresearch/kinetic/main/scripts/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --version 0.1.0 --cpu
+#   curl -fsSL .../install.sh | sh -s -- --nightly
 set -eu
 
 repo=Veloresearch/kinetic
@@ -19,7 +20,7 @@ version=
 variant=
 
 usage() {
-    echo "usage: install.sh [--version VERSION] [--cpu]"
+    echo "usage: install.sh [--version VERSION | --nightly] [--cpu]"
 }
 
 while [ $# -gt 0 ]; do
@@ -27,6 +28,7 @@ while [ $# -gt 0 ]; do
         --version) [ $# -ge 2 ] || { usage >&2; exit 2; }; version="$2"; shift 2 ;;
         --version=*) version="${1#--version=}"; shift ;;
         --cpu) variant=cpu; shift ;;
+        --nightly) version=nightly; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -81,7 +83,10 @@ fi
 [ -n "$variant" ] || variant=cuda
 
 name="kinetic-${version}-${target}-${variant}"
-base="https://github.com/$repo/releases/download/v${version}"
+tag="v${version}"
+# the nightly prerelease: an untested build of main, replaced every night
+[ "$version" != nightly ] || tag=nightly
+base="https://github.com/$repo/releases/download/${tag}"
 echo "Downloading Kinetic ${version} (${variant} build)"
 fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz"
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS"

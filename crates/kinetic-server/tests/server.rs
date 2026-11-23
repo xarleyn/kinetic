@@ -139,6 +139,82 @@ fn stream_matches_the_plain_answer() {
         .all(|c| c["object"] == "chat.completion.chunk"));
 }
 
+fn logprob_question(answer: &str) -> Value {
+    let mut body = question("Reply with the requested text.");
+    body["grammar"] = format!("root ::= {answer:?}").into();
+    body["logprobs"] = true.into();
+    body["top_logprobs"] = 1.into();
+    body
+}
+
+fn chat_logprobs(response: &Value) -> &[Value] {
+    response["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .unwrap()
+}
+
+fn check_chat_logprobs(mut body: Value, text: &str, sampled: usize, expected: &[Value]) {
+    let plain = chat(body.clone());
+    assert_eq!(plain["choices"][0]["message"]["content"], text);
+    assert_eq!(chat_logprobs(&plain), expected);
+    assert_eq!(plain["usage"]["completion_tokens"], sampled);
+
+    body["stream"] = true.into();
+    body["stream_options"] = json!({"include_usage": true});
+    let chunks: Vec<Value> = events(body)
+        .iter()
+        .filter(|e| *e != "[DONE]")
+        .map(|c| serde_json::from_str(c).unwrap())
+        .collect();
+    let entries: Vec<_> = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["logprobs"]["content"].as_array())
+        .flatten()
+        .cloned()
+        .collect();
+    assert_eq!(entries, expected);
+    let usage = &chunks.last().unwrap()["usage"];
+    assert_eq!(usage["completion_tokens"], sampled);
+}
+
+#[test]
+#[ignore = "needs KINETIC_TEST_GGUF"]
+fn chat_logprobs_after_string_stop() {
+    let mut body = logprob_question("A Paris");
+    let full = chat(body.clone());
+    let entries = chat_logprobs(&full);
+    assert!(entries.len() > 1);
+    // Release the buffered "A" as " Paris" stops the generation.
+    body["stop"] = json!(["A Berlin", " Paris"]);
+    check_chat_logprobs(body, "A", entries.len(), &entries[..1]);
+}
+
+#[test]
+#[ignore = "needs KINETIC_TEST_GGUF with a split UTF-8 character"]
+fn chat_logprobs_after_utf8_cutoff() {
+    let mut body = logprob_question("A\u{1f642}");
+    let full = chat(body.clone());
+    let entries = chat_logprobs(&full);
+    let mut bytes = Vec::new();
+    let cut = entries
+        .iter()
+        .enumerate()
+        .find_map(|(i, entry)| {
+            bytes.extend(
+                entry["bytes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| u8::try_from(b.as_u64().unwrap()).unwrap()),
+            );
+            (i > 0 && std::str::from_utf8(&bytes).is_err()).then_some(i + 1)
+        })
+        .expect("the test tokenizer must split the character across tokens");
+    body["stop"] = json!(["A Berlin"]);
+    body["max_tokens"] = cut.into();
+    check_chat_logprobs(body, "A", cut, &entries[..1]);
+}
+
 #[test]
 #[ignore = "needs KINETIC_TEST_GGUF"]
 fn polish_text_streams_intact() {

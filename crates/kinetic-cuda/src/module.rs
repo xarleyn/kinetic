@@ -4,8 +4,11 @@ use std::rc::Rc;
 
 use crate::context::Context;
 use crate::driver::{CuFunction, CuModule};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::stream::Stream;
+
+/// `CUDA_ERROR_NO_BINARY_FOR_GPU`: the image has no code this device runs.
+const NO_BINARY_FOR_GPU: i32 = 209;
 
 /// Loaded device code.
 pub struct Module {
@@ -24,9 +27,18 @@ impl Module {
         let api = ctx.enter()?;
         let mut raw = ptr::null_mut();
         // SAFETY: the caller guarantees the image is well-formed.
-        api.check("cuModuleLoadData", unsafe {
+        let loaded = api.check("cuModuleLoadData", unsafe {
             (api.module_load_data)(&mut raw, image.as_ptr().cast::<c_void>())
-        })?;
+        });
+        if let Err(Error::Cuda {
+            code: NO_BINARY_FOR_GPU,
+            ..
+        }) = loaded
+        {
+            let info = ctx.device().info()?;
+            return Err(Error::KernelsNotBuiltFor(info.compute_capability));
+        }
+        loaded?;
         Ok(Rc::new(Module {
             raw,
             ctx: ctx.clone(),
@@ -79,6 +91,8 @@ impl LaunchConfig {
 
 /// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES from cuda.h.
 const MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+/// CU_FUNC_ATTRIBUTE_BINARY_VERSION from cuda.h.
+const BINARY_VERSION: c_int = 6;
 
 /// A kernel in a loaded [`Module`].
 pub struct Function {
@@ -95,6 +109,18 @@ impl Function {
         api.check("cuFuncSetAttribute", unsafe {
             (api.func_set_attribute)(self.raw, MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as c_int)
         })
+    }
+
+    /// The compute capability the loaded binary was built for, as
+    /// 10 major + minor: what runs, which may be older than the device.
+    pub fn binary_version(&self) -> Result<u32> {
+        let api = self.module.ctx.enter()?;
+        let mut v: c_int = 0;
+        // SAFETY: the function is live and `v` a valid out-pointer.
+        api.check("cuFuncGetAttribute", unsafe {
+            (api.func_get_attribute)(&mut v, BINARY_VERSION, self.raw)
+        })?;
+        Ok(v as u32)
     }
 
     /// Queues the kernel on `stream`.

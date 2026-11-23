@@ -1,0 +1,43 @@
+name: Feature request
+description: Something Kinetic does not do yet that you would like it to.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. For a model Kinetic does not run, or for something that is
+        slower than expected, the other forms ask the right questions.
+        If you would like to build it yourself, say so below: anything larger than a
+        small fix is agreed in an issue before a pull request.
+  - type: textarea
+    id: what
+    attributes:
+      label: What you would like
+      description: What Kinetic should do, in a few sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: What it would let you do
+      description: The task or workflow this is for.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: A workaround, another tool, or nothing.
+  - type: dropdown
+    id: build
+    attributes:
+      label: Would you like to build it?
+      options:
+        - "No"
+        - "Yes, I would like to send a pull request"
+        - "Maybe, with some pointers"
+  - type: input
+    id: version
+    attributes:
+      label: Kinetic version
+      placeholder: kinetic 0.1.0

@@ -1,5 +1,7 @@
 //! What a device is and offers, whichever driver reports it.
 
+use crate::physical::SUBGROUP;
+
 /// What kind of processor a device is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -86,9 +88,16 @@ impl DeviceInfo {
         if (major, minor) < (1, 3) {
             lacks.push(format!("Vulkan 1.3 (driver offers {major}.{minor})"));
         }
+        let subgroups = match (self.subgroups_too_wide(), f.subgroup_size_range) {
+            (true, (min, max)) if min == max => {
+                format!("subgroups of 32 (this GPU only runs {min})")
+            }
+            (true, (min, max)) => format!("subgroups of 32 (this GPU only runs {min} to {max})"),
+            (false, _) => "subgroups of 32".into(),
+        };
         for (have, what) in [
             (f.subgroup_arithmetic, "subgroup arithmetic"),
-            (f.subgroup_size_32, "subgroups of 32"),
+            (f.subgroup_size_32, subgroups.as_str()),
             (f.integer_dot_product, "integer dot products"),
             (f.push_descriptor, "push descriptors"),
         ] {
@@ -97,5 +106,84 @@ impl DeviceInfo {
             }
         }
         (!lacks.is_empty()).then(|| format!("needs {}", lacks.join(", ")))
+    }
+
+    /// The device only runs subgroups wider than the 32 the kernels are
+    /// written for, which is the hardware and not its driver.
+    pub fn subgroups_too_wide(&self) -> bool {
+        let (min, _) = self.features.subgroup_size_range;
+        !self.features.subgroup_size_32 && min > SUBGROUP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(api_version: (u32, u32, u32), features: Features) -> DeviceInfo {
+        DeviceInfo {
+            name: "test".into(),
+            kind: DeviceKind::Integrated,
+            vendor_id: 0x1002,
+            device_id: 0,
+            api_version,
+            driver_name: String::new(),
+            driver_info: String::new(),
+            device_local_bytes: 0,
+            max_buffer_bytes: 0,
+            timestamp_period: 1.0,
+            features,
+        }
+    }
+
+    fn capable() -> Features {
+        Features {
+            subgroup_arithmetic: true,
+            integer_dot_product: true,
+            push_descriptor: true,
+            ..Features::default()
+        }
+    }
+
+    #[test]
+    fn a_wave64_gpu_is_too_wide() {
+        let gcn = device(
+            (1, 3, 260),
+            Features {
+                subgroup_size: 64,
+                subgroup_size_range: (64, 64),
+                ..capable()
+            },
+        );
+        assert!(gcn.subgroups_too_wide());
+        assert_eq!(
+            gcn.missing().as_deref(),
+            Some("needs subgroups of 32 (this GPU only runs 64)")
+        );
+    }
+
+    #[test]
+    fn an_old_driver_is_not_too_wide() {
+        let old = device((1, 2, 0), capable());
+        assert!(!old.subgroups_too_wide());
+        assert_eq!(
+            old.missing().as_deref(),
+            Some("needs Vulkan 1.3 (driver offers 1.2), subgroups of 32")
+        );
+    }
+
+    #[test]
+    fn a_gpu_with_subgroups_of_32_runs() {
+        let rdna = device(
+            (1, 3, 260),
+            Features {
+                subgroup_size: 64,
+                subgroup_size_range: (32, 64),
+                subgroup_size_32: true,
+                ..capable()
+            },
+        );
+        assert!(!rdna.subgroups_too_wide());
+        assert_eq!(rdna.missing(), None);
     }
 }

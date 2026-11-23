@@ -7,9 +7,7 @@ use kinetic_vulkan::{ConvRing, KvCache};
 
 use super::layer::{LayerState, VulkanLayer};
 use super::{VulkanModel, VulkanState};
-use crate::device_state::{
-    narrow, past_to_ring, ring_to_past, slots_to_window, widen, window_to_slots,
-};
+use crate::device_state::{narrow, past_to_ring, slots_to_window, widen, window_to_slots};
 use crate::model::Mark;
 use crate::warm::Runner;
 use crate::{Model, State};
@@ -17,14 +15,7 @@ use crate::{Model, State};
 type R<T> = kinetic_vulkan::Result<T>;
 
 fn ring_past(ring: &ConvRing, pos: usize) -> R<Vec<f32>> {
-    let slots = ring.save()?;
-    Ok(ring_to_past(
-        &slots,
-        ring.slots(),
-        ring.channels(),
-        ring.taps(),
-        pos,
-    ))
+    ring.save_past(pos)
 }
 
 fn load_ring(ring: &mut ConvRing, past: &[f32], pos: usize) -> R<()> {

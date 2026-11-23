@@ -18,6 +18,8 @@ pub enum Error {
     },
     /// The crate was compiled without nvcc and carries no kernels.
     KernelsNotBuilt,
+    /// The kernels were built without code for this compute capability.
+    KernelsNotBuiltFor((u32, u32)),
     /// No GEMV kernel exists for this weight type.
     Unsupported(TensorType),
     /// Sizes that do not fit together.
@@ -37,6 +39,12 @@ impl fmt::Display for Error {
             Error::Cuda { call, code, name } => write!(f, "{call} failed: {name} ({code})"),
             Error::KernelsNotBuilt => f.write_str(
                 "CUDA kernels not built: nvcc was not found when kinetic-cuda was compiled",
+            ),
+            Error::KernelsNotBuiltFor((major, minor)) => write!(
+                f,
+                "CUDA kernels not built for compute capability {major}.{minor}; \
+                 Pascal and Volta (6.0 to 7.0) need a build with CUDA 12, \
+                 and KINETIC_CUDA_ARCHS, when set, must include the GPU"
             ),
             Error::Unsupported(ty) => write!(f, "no CUDA GEMV kernel for {ty}"),
             Error::Shape(msg) => f.write_str(msg),

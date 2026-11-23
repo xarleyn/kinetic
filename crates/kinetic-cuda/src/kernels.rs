@@ -32,6 +32,14 @@ pub struct Kernels {
     /// Matrix products for larger batches, by weight type and tile width,
     /// where the device has the shared memory they need.
     pub(crate) gemm: Vec<Vec<Function>>,
+    /// Without tensor cores: the product of weights expanded to f16 by the
+    /// `unpack` kernels in `gemm`, and the f16 weights of each stream that
+    /// has used it, grown as needed and as memory allows; see
+    /// [`Kernels::gemm`].
+    pub(crate) pgemm_f16w: Option<Function>,
+    pub(crate) unpacked: std::cell::RefCell<Vec<crate::gemm::Unpacked>>,
+    /// Most values a stream's expanded weights may take; tests lower it.
+    pub(crate) unpack_limit: std::cell::Cell<usize>,
     pub(crate) quantize_q8: Function,
     pub(crate) fold_rows: Function,
     pub(crate) unfold_rows: Function,
@@ -51,6 +59,8 @@ pub struct Kernels {
     /// Attention for batches larger than [`MAX_BATCH`], where the device has
     /// the shared memory it needs.
     pub(crate) attn_flash: Option<Function>,
+    /// The same in f32 without tensor cores, for heads of 128 to 512.
+    pub(crate) attn_tile: Option<Function>,
     pub(crate) attn_combine: Function,
     pub(crate) attn_copy_kv: Function,
     pub(crate) delta_conv: Function,
@@ -58,6 +68,7 @@ pub struct Kernels {
     pub(crate) delta_ring_store: Function,
     pub(crate) delta_chunk_prep: Function,
     pub(crate) delta_chunk_scan: Function,
+    pub(crate) delta_chunk_scan_f32: Function,
     pub(crate) delta_rule: Function,
     pub(crate) delta_gated_norm: Function,
     pub(crate) short_conv_q8: Function,
@@ -77,6 +88,10 @@ pub struct Kernels {
     pub(crate) moe_assign: Function,
     read_sum: Function,
     pub(crate) multiprocessors: u32,
+    /// See [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores).
+    pub(crate) tensor_cores: bool,
+    /// See [`Kernels::half_products`].
+    pub(crate) half: bool,
 }
 
 impl Kernels {
@@ -106,12 +121,27 @@ impl Kernels {
                 ])
             })
             .transpose()?;
-        let gemm = gemm_functions(&module)?;
+        // The tiled products and flash attention run on tensor cores; without
+        // them both run in f32, and attention to heads of 64 MAX_BATCH tokens
+        // at a time.
+        let tensor_cores = info.tensor_cores();
+        let gemm = gemm_functions(&module, tensor_cores)?;
+        // The binary that runs is for sm_60 or sm_70.
+        let half = !tensor_cores
+            && gemm
+                .iter()
+                .find_map(|fs| fs.first())
+                .and_then(|f| f.binary_version().ok())
+                .is_some_and(|v| v == 60 || v == 70);
         let attn_flash = module.function(c"attn_flash")?;
-        let attn_flash = attn_flash
-            .allow_shared(FLASH_HEADS.into_iter().map(flash_shared).max().unwrap_or(0))
-            .is_ok()
-            .then_some(attn_flash);
+        let attn_flash = (tensor_cores
+            && attn_flash
+                .allow_shared(FLASH_HEADS.into_iter().map(flash_shared).max().unwrap_or(0))
+                .is_ok())
+        .then_some(attn_flash);
+        let attn_tile = (!tensor_cores)
+            .then(|| module.function(c"attn_tile"))
+            .transpose()?;
         let moe = |prefix: &str| -> Result<[Function; EXPERT_TYPES.len()]> {
             let named = |ty: &str| {
                 module.function(
@@ -130,6 +160,11 @@ impl Kernels {
             gemv,
             gemv_mma,
             gemm,
+            pgemm_f16w: (!tensor_cores)
+                .then(|| module.function(c"pgemm_f16w"))
+                .transpose()?,
+            unpacked: std::cell::RefCell::new(Vec::new()),
+            unpack_limit: std::cell::Cell::new(usize::MAX),
             quantize_q8: module.function(c"quantize_q8")?,
             fold_rows: module.function(c"fold_rows")?,
             unfold_rows: module.function(c"unfold_rows")?,
@@ -149,6 +184,7 @@ impl Kernels {
                 module.function(c"attn_chunk_2")?,
             ],
             attn_flash,
+            attn_tile,
             attn_combine: module.function(c"attn_combine")?,
             attn_copy_kv: module.function(c"attn_copy_kv")?,
             delta_conv: module.function(c"delta_conv")?,
@@ -156,6 +192,7 @@ impl Kernels {
             delta_ring_store: module.function(c"delta_ring_store")?,
             delta_chunk_prep: module.function(c"delta_chunk_prep")?,
             delta_chunk_scan: module.function(c"delta_chunk_scan")?,
+            delta_chunk_scan_f32: module.function(c"delta_chunk_scan_f32")?,
             delta_rule: module.function(c"delta_rule")?,
             delta_gated_norm: module.function(c"delta_gated_norm")?,
             short_conv_q8: module.function(c"short_conv_q8")?,
@@ -174,13 +211,41 @@ impl Kernels {
             moe_assign: module.function(c"moe_assign")?,
             read_sum: module.function(c"read_sum")?,
             multiprocessors: info.multiprocessors,
+            tensor_cores,
+            half,
         })
     }
 
     /// Whether batches of more than [`MAX_BATCH`] tokens can run in one pass;
-    /// without, they must go in steps of at most that many.
+    /// without, they must go in steps of at most that many. Devices without
+    /// tensor cores run them with f32 products and attention, attention to
+    /// heads of 64 in steps of [`MAX_BATCH`] tokens, and the delta rule in
+    /// chunks on the CUDA cores.
     pub fn large_batches(&self) -> bool {
-        self.attn_flash.is_some()
+        self.attn_flash.is_some() || !self.tensor_cores
+    }
+
+    /// Whether the device has the tensor-core instructions the kernels use;
+    /// see [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores).
+    pub fn tensor_cores(&self) -> bool {
+        self.tensor_cores
+    }
+
+    /// Whether the products of large batches multiply in f16 pairs: on
+    /// devices without tensor cores, where the binary that runs is for sm_60
+    /// or sm_70, whose f16 arithmetic is twice as fast as f32. They are then
+    /// accurate to about one part in a thousand of their terms rather than
+    /// to f32 rounding.
+    pub fn half_products(&self) -> bool {
+        self.half
+    }
+
+    /// Caps each stream's weights expanded to f16 at `values`, as when
+    /// memory is short, and drops those expanded so far; for tests.
+    #[doc(hidden)]
+    pub fn limit_unpacked(&self, values: usize) {
+        self.unpack_limit.set(values);
+        self.unpacked.borrow_mut().clear();
     }
 
     /// Reads all of `data` once and adds its sum as 32-bit words to `out[0]`.

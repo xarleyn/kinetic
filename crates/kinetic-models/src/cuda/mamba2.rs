@@ -63,7 +63,7 @@ impl CudaMamba2 {
     }
 
     pub fn new_state(&self, gpu: &Gpu) -> kinetic_cuda::Result<SsmState> {
-        SsmState::new(&gpu.ctx, &self.shape)
+        SsmState::new(&gpu.ctx, &gpu.stream, &self.shape)
     }
 
     /// Needs for batches of up to `rows` tokens.
