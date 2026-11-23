@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Explicit opt-in capture for offline quantization experiments.
+calibration = []
+
 [dependencies]
 half.workspace = true
 kinetic-quant = { path = "../kinetic-quant" }

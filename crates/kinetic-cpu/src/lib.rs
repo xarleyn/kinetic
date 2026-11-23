@@ -5,6 +5,8 @@
 //! falls back to dequantizing each row to f32, which is also the reference
 //! the fast kernels are tested against.
 
+#[cfg(feature = "calibration")]
+pub mod calibration;
 mod fdot;
 mod kdot;
 mod kernel_input;

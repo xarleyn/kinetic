@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+calibration = ["kinetic-cpu/calibration"]
 cuda = ["dep:kinetic-cuda"]
 vulkan = ["dep:kinetic-vulkan"]
 
@@ -21,6 +22,10 @@ rayon.workspace = true
 
 [dev-dependencies]
 kinetic-tokenizer = { path = "../kinetic-tokenizer" }
+
+[[example]]
+name = "calibration_inputs"
+required-features = ["calibration"]
 
 [[example]]
 name = "cuda_parity"

@@ -60,6 +60,9 @@ pub fn matmul_many(ws: &[&Matrix], x: &[f32], ys: &mut [&mut [f32]]) {
         assert_eq!(y.len(), n * w.rows);
     }
 
+    #[cfg(feature = "calibration")]
+    crate::calibration::observe(ws, x);
+
     let paths: Vec<Path> = ws.iter().map(|w| Path::of(w, n)).collect();
     let needs = |want: fn(Path) -> bool| paths.iter().any(|&p| want(p));
     let xk: Vec<Q8K> = if needs(|p| matches!(p, Path::K(_))) {
