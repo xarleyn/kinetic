@@ -27,6 +27,7 @@ pub mod receipt;
 mod rerank;
 mod sequence;
 mod server;
+pub mod systemone;
 mod template;
 pub use template::ChatTemplate;
 mod text;
@@ -44,7 +45,9 @@ pub use engine::{Completion, Engine, Finish, Prompt, Request, RequestError};
 pub use kinetic_models::speculative::{Logprobs, Sampler, Sampling, TokenLogprob};
 pub use model_info::ModelInfo;
 pub use receipt::{Receipt, Receipts};
-pub use server::{serve, serve_embeddings, serve_embeddings_with, serve_with, Options};
+pub use server::{
+    serve, serve_embeddings, serve_embeddings_with, serve_systemone, serve_with, Options,
+};
 pub use text::Split;
 pub use tool_calls::ToolCall;
 #[cfg(feature = "vulkan")]

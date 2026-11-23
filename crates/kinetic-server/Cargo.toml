@@ -9,9 +9,16 @@ license.workspace = true
 [features]
 cuda = ["dep:kinetic-cuda", "kinetic-models/cuda", "kinetic-vision/cuda"]
 vulkan = ["dep:kinetic-vulkan", "kinetic-models/vulkan"]
+laya-onnx = ["dep:laya", "dep:ort"]
+jeff-onnx = [
+    "dep:kinetic-cpu", "dep:memmap2", "dep:mlmf-pickle", "dep:ort",
+    "dep:regex", "dep:tokenizers", "ort/default", "serde_json/preserve_order",
+]
 
 [dependencies]
 blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
+flate2 = "1.1.10"
+kinetic-cpu = { path = "../kinetic-cpu", optional = true }
 kinetic-cuda = { path = "../kinetic-cuda", optional = true }
 kinetic-gguf = { path = "../kinetic-gguf" }
 kinetic-grammar = { path = "../kinetic-grammar" }
@@ -20,10 +27,17 @@ kinetic-models = { path = "../kinetic-models" }
 kinetic-tokenizer = { path = "../kinetic-tokenizer" }
 kinetic-vision = { path = "../kinetic-vision" }
 kinetic-vulkan = { path = "../kinetic-vulkan", optional = true }
+laya = { package = "laya-onnx", git = "https://github.com/NandhaKishorM/laya", rev = "416dd9ed20da2d43fc40e23712e9adceefabf634", default-features = false, optional = true }
+memmap2 = { workspace = true, optional = true }
 minijinja = { version = "2.24.0", features = ["fuel", "json", "loop_controls"] }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
+mlmf-pickle = { version = "0.11.49", optional = true }
+# Laya uses Session::builder() from this release candidate's API.
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }
+regex = { version = "1.13.1", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-
-[dev-dependencies]
-ureq = { version = "2.12.1", default-features = false, features = ["json"] }
+serde_json = { version = "1.0.149", features = ["raw_value"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+ureq = { version = "2.12.1", default-features = false, features = ["json", "tls"] }
+url = "2.5"
+zstd = "0.13.3"

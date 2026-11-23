@@ -16,7 +16,7 @@ use crate::engine::{Completion, Engine, Prompt, Request, RequestError};
 use crate::http::{self, Head, ReadError, Status};
 use crate::text::Split;
 use crate::Logprobs;
-use crate::{llama, logprobs, ollama, receipt};
+use crate::{llama, logprobs, ollama, receipt, systemone};
 
 /// Time a client has to send its whole request.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,9 +41,12 @@ pub fn serve(engine: &Engine, listener: TcpListener) {
 
 /// [`serve`] with `options`.
 pub fn serve_with(engine: &Engine, listener: TcpListener, options: &Options) {
-    serve_routes(listener, options, &|head, body, out| {
-        route(engine, head, body, out)
-    });
+    serve_routes(
+        listener,
+        options,
+        Protocol::Generation,
+        &|head, body, out| route(engine, head, body, out),
+    );
 }
 
 /// Serves `/v1/embeddings` for an embedding model, or `/v1/rerank` for a
@@ -54,14 +57,54 @@ pub fn serve_embeddings(model: &Embeddings, listener: TcpListener) {
 
 /// [`serve_embeddings`] with `options`.
 pub fn serve_embeddings_with(model: &Embeddings, listener: TcpListener, options: &Options) {
-    serve_routes(listener, options, &|head, body, out| {
-        embeddings::route(model, head, body, out)
-    });
+    serve_routes(
+        listener,
+        options,
+        Protocol::Generation,
+        &|head, body, out| embeddings::route(model, head, body, out),
+    );
 }
 
 type Routes<'r> = dyn Fn(&Head, &[u8], &mut &TcpStream) -> Result<(), ApiError> + Sync + 'r;
 
-fn serve_routes(listener: TcpListener, options: &Options, routes: &Routes) {
+/// The TypeSafe wire API has its own catalog, error envelope and HTTP limits.
+pub fn serve_systemone(server: &systemone::Server, listener: TcpListener, options: &Options) {
+    serve_routes(
+        listener,
+        options,
+        Protocol::SystemOne,
+        &|head, body, out| {
+            server.route(head, body, out);
+            Ok(())
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+enum Protocol {
+    Generation,
+    SystemOne,
+}
+
+impl Protocol {
+    fn max_body(self) -> usize {
+        match self {
+            Self::Generation => http::MAX_BODY,
+            Self::SystemOne => systemone::MAX_BODY,
+        }
+    }
+
+    fn send_error(self, out: &mut impl Write, error: &ApiError) {
+        match self {
+            Self::Generation => {
+                let _ = send_error(out, error);
+            }
+            Self::SystemOne => systemone::send_error(out, error),
+        }
+    }
+}
+
+fn serve_routes(listener: TcpListener, options: &Options, protocol: Protocol, routes: &Routes) {
     let active = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for stream in listener.incoming() {
@@ -72,15 +115,20 @@ fn serve_routes(listener: TcpListener, options: &Options, routes: &Routes) {
             if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
                 active.fetch_sub(1, Ordering::AcqRel);
                 let busy = ApiError {
-                    status: 503,
+                    status: match protocol {
+                        Protocol::Generation => 503,
+                        Protocol::SystemOne => 529,
+                    },
                     message: "the server is busy".into(),
                 };
-                let _ = send_error(&mut &stream, &busy);
+                protocol.send_error(&mut &stream, &busy);
                 continue;
             }
             let active = &active;
             scope.spawn(move || {
-                let _ = catch_unwind(AssertUnwindSafe(|| handle(options, routes, &stream)));
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    handle(options, protocol, routes, &stream)
+                }));
                 active.fetch_sub(1, Ordering::AcqRel);
             });
         }
@@ -104,7 +152,7 @@ impl Read for Deadline<'_> {
     }
 }
 
-fn handle(options: &Options, routes: &Routes, stream: &TcpStream) {
+fn handle(options: &Options, protocol: Protocol, routes: &Routes, stream: &TcpStream) {
     let mut out = stream;
     let mut reader = BufReader::new(Deadline {
         stream,
@@ -112,27 +160,53 @@ fn handle(options: &Options, routes: &Routes, stream: &TcpStream) {
     });
     let head = match http::read_head(&mut reader) {
         Ok(head) => head,
-        Err(ReadError::Bad(status)) => return refuse(&mut out, status),
+        Err(ReadError::Bad(status)) => return refuse(&mut out, protocol, status),
         Err(ReadError::Io) => return,
     };
-    let len = match head.content_length() {
-        Ok(len) => len,
-        Err(status) => return refuse(&mut out, status),
+    let mut transfer = head.values("transfer-encoding");
+    let chunked = matches!(protocol, Protocol::SystemOne)
+        && transfer
+            .next()
+            .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+        && transfer.next().is_none();
+    let len = if chunked {
+        if head.header("content-length").is_some() {
+            return refuse(
+                &mut out,
+                protocol,
+                Status(400, "send a single request body framing"),
+            );
+        }
+        0
+    } else {
+        match head.content_length(protocol.max_body()) {
+            Ok(len) => len,
+            Err(status) => return refuse(&mut out, protocol, status),
+        }
     };
-    if len > 0 && head.expects_continue() && http::write_continue(&mut out).is_err() {
+    if (len > 0 || chunked) && head.expects_continue() && http::write_continue(&mut out).is_err() {
         return;
     }
-    let Ok(body) = http::read_body(&mut reader, len) else {
-        return;
+    let body = if chunked {
+        match http::read_chunked(&mut reader, protocol.max_body()) {
+            Ok(body) => body,
+            Err(ReadError::Bad(status)) => return refuse(&mut out, protocol, status),
+            Err(ReadError::Io) => return,
+        }
+    } else {
+        let Ok(body) = http::read_body(&mut reader, len) else {
+            return;
+        };
+        body
     };
     if let Some(key) = &options.api_key {
         if let Err(e) = authorize(&head, key) {
-            let _ = send_error(&mut out, &e);
+            protocol.send_error(&mut out, &e);
             return;
         }
     }
     if let Err(e) = routes(&head, &body, &mut out) {
-        let _ = send_error(&mut out, &e);
+        protocol.send_error(&mut out, &e);
     }
 }
 
@@ -161,8 +235,8 @@ fn same_key(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-fn refuse(out: &mut impl Write, Status(status, message): Status) {
-    let _ = send_error(
+fn refuse(out: &mut impl Write, protocol: Protocol, Status(status, message): Status) {
+    protocol.send_error(
         out,
         &ApiError {
             status,

@@ -21,6 +21,83 @@ does not serve, such as `/v1/embeddings` on a text model, is answered with a
 
 `/v1/health` answers `{"status": "ok"}` once the model is loaded.
 
+## System One decision models
+
+`kinetic serve-systemone --config decisions.json` serves the TypeSafe API.
+Use the server root (for example `http://127.0.0.1:8080`) as
+`TYPESAFE_BASE_URL` in a TypeSafe SDK. `GET /v1/models` lists the model names
+clients can send. `POST /v1/systemone` accepts a shared `state` and named
+`choice`, `score`, and `noul` questions in one call. Responses include the
+model that answered, the matching answer IDs, and token usage.
+
+This catalog runs Jeff GLiFormer and Laya inside the Kinetic process.
+
+```json
+{
+  "default_model": "jev-latest",
+  "models": [
+    {
+      "name": "jev-latest",
+      "description": "Jeff GLiFormer",
+      "release_date": "2026-09-16",
+      "jeff_onnx": "./models/gliformer-large-v1",
+      "jeff_isolate": "none"
+    },
+    {
+      "name": "laya",
+      "description": "Laya ModernBERT on ONNX Runtime",
+      "release_date": "2026-09-18",
+      "laya_onnx": "./models/laya"
+    }
+  ]
+}
+```
+
+- Build with `cargo build --locked --release -p kinetic-cli --features jeff-onnx,laya-onnx`.
+  Use either feature on its own to enable just that backend.
+- Point `jeff_onnx` at the GLiFormer Large v1 directory. Kinetic reads its
+  `gliner_config.json`, `tokenizer.json`, and classifier weights from
+  `pytorch_model.bin`. It runs the encoder through ONNX Runtime and computes
+  the classifier and Jeff probabilities in Rust. It uses
+  `onnx/encoder.int8.onnx` when available and `onnx/encoder.onnx` otherwise.
+  Set `"jeff_encoder": "onnx/encoder.onnx"` to select the FP32 graph explicitly.
+  You can reuse Jeff's existing export or create one with
+  [Jeff's encoder exporter](https://github.com/logan-markewich/jeff/blob/main/scripts/export_onnx.py).
+  `jeff_isolate` selects which questions get a separate encoder input.
+  `nouls` is the default. Use `none` for a shared input or `all` to isolate
+  every question.
+- Point `laya_onnx` at an
+  [exported Laya ONNX checkpoint](https://github.com/NandhaKishorM/laya/blob/main/laya-rust/MODELS.md).
+  Text inference uses the checkpoint's tokenizer, decision head and calibration.
+- Relative model directories are resolved from the catalog file. A relative
+  `jeff_encoder` path is resolved from the Jeff model directory.
+- Any HTTP(S) provider that speaks System One can use `base_url`, including
+  [laya-serve](https://nandhakishorm.github.io/laya/http-api/). The URL may
+  end in `/v1`. `upstream_model` is optional and maps the public catalog
+  name to the provider's model ID. The provider key comes from `api_key_env`
+  when configured. Use `--api-key-env KINETIC_API_KEY` to require a
+  separate bearer key from clients. Omit `default_model` to require a model
+  name on each request.
+- For a vision-capable HTTP provider, set `"supports_images": true`.
+  Kinetic forwards `assets`, multipart image bytes, `box` questions and the
+  TypeSafe feature headers. The selected provider performs vision inference
+  and determines the available context length. Local Jeff and Laya serve text.
+
+```sh
+kinetic serve-systemone --config decisions.json --api-key-env KINETIC_API_KEY
+curl http://127.0.0.1:8080/v1/systemone \
+  -H "Authorization: Bearer $KINETIC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"laya","state":"I was charged twice.","questions":{
+        "duplicate":{"type":"noul","instructions":"Did the customer report a duplicate charge?"}
+      }}'
+```
+
+The decision server accepts uncompressed, gzip and zstd request bodies,
+with a 32 MiB limit before and after decompression. See the
+[TypeSafe API reference](https://docs.typesafe.ai/api/system-one) for the
+wire schema.
+
 ## Models
 
 ```sh

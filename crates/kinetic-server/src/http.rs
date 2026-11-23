@@ -28,15 +28,21 @@ impl Head {
             .map(|(_, v)| v.as_str())
     }
 
+    pub fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.headers
+            .iter()
+            .filter_map(move |(n, v)| n.eq_ignore_ascii_case(name).then_some(v.as_str()))
+    }
+
     /// The body length, checked against [`MAX_BODY`].
-    pub fn content_length(&self) -> Result<usize, Status> {
+    pub fn content_length(&self, max_body: usize) -> Result<usize, Status> {
         if self.header("transfer-encoding").is_some() {
             return Err(Status(411, "send the body with a Content-Length"));
         }
         match self.header("content-length") {
             None => Ok(0),
             Some(v) => match v.trim().parse::<usize>() {
-                Ok(n) if n > MAX_BODY => Err(Status(413, "the request body is too large")),
+                Ok(n) if n > max_body => Err(Status(413, "the request body is too large")),
                 Ok(n) => Ok(n),
                 Err(_) => Err(Status(400, "Content-Length is not a number")),
             },
@@ -140,11 +146,58 @@ pub fn read_body(r: &mut impl BufRead, len: usize) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Reads a chunked body with the same aggregate bound as a sized body.
+pub fn read_chunked(r: &mut impl BufRead, max_body: usize) -> Result<Vec<u8>, ReadError> {
+    let malformed = || Status(400, "malformed chunked body");
+    let mut body = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        r.by_ref().take(1024).read_until(b'\n', &mut line)?;
+        let line = line.strip_suffix(b"\r\n").ok_or_else(malformed)?;
+        let size = line.split(|&b| b == b';').next().unwrap_or_default();
+        let size = std::str::from_utf8(size).map_err(|_| malformed())?;
+        if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(malformed().into());
+        }
+        let size = usize::from_str_radix(size, 16)
+            .map_err(|_| Status(413, "the request body is too large"))?;
+        if size == 0 {
+            // There is no next request on this connection. Consume the optional
+            // trailers within the same header allowance as the request head.
+            let mut trailers = r.take(MAX_HEAD as u64);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                trailers.read_until(b'\n', &mut line)?;
+                if line == b"\r\n" {
+                    return Ok(body);
+                }
+                if !line.ends_with(b"\r\n") || !line.contains(&b':') {
+                    return Err(malformed().into());
+                }
+            }
+        }
+        let start = body.len();
+        if size > max_body - start {
+            return Err(Status(413, "the request body is too large").into());
+        }
+        body.resize(start + size, 0);
+        r.read_exact(&mut body[start..])?;
+        let mut end = [0; 2];
+        r.read_exact(&mut end)?;
+        if end != *b"\r\n" {
+            return Err(malformed().into());
+        }
+    }
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -152,10 +205,15 @@ fn reason(status: u16) -> &'static str {
         411 => "Length Required",
         413 => "Content Too Large",
         415 => "Unsupported Media Type",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         505 => "HTTP Version Not Supported",
+        529 => "Overloaded",
         _ => "",
     }
 }
@@ -173,12 +231,26 @@ pub fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> io::Result<()> {
+    write_response_with_headers(w, status, content_type, &[], body)
+}
+
+pub fn write_response_with_headers(
+    w: &mut impl Write,
+    status: u16,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> io::Result<()> {
     write!(
         w,
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         reason(status),
         body.len()
     )?;
+    for (name, value) in headers {
+        write!(w, "{name}: {value}\r\n")?;
+    }
+    w.write_all(b"\r\n")?;
     w.write_all(body)?;
     w.flush()
 }
@@ -214,6 +286,23 @@ pub fn write_event(w: &mut impl Write, data: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn chunked_bodies_are_bounded_and_consume_trailers() {
+        let mut body = &b"3;name=value\r\nabc\r\n2\r\nde\r\n0\r\nTrailer: yes\r\n\r\n"[..];
+        assert_eq!(read_chunked(&mut body, 5).unwrap(), b"abcde");
+        assert!(body.is_empty());
+        let mut too_large = &b"3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"[..];
+        assert!(matches!(
+            read_chunked(&mut too_large, 5),
+            Err(ReadError::Bad(Status(413, _)))
+        ));
+        let mut malformed = &b"4\r\nabcd  \r\n0\r\n\r\n"[..];
+        assert!(matches!(
+            read_chunked(&mut malformed, 8),
+            Err(ReadError::Bad(Status(400, _)))
+        ));
+    }
+
     fn head(raw: &str) -> Result<Head, ReadError> {
         read_head(&mut raw.as_bytes())
     }
@@ -228,7 +317,7 @@ mod tests {
             ("POST", "/v1/chat/completions")
         );
         assert_eq!(h.header("Content-Type"), Some("application/json"));
-        assert_eq!(h.content_length(), Ok(2));
+        assert_eq!(h.content_length(MAX_BODY), Ok(2));
         assert_eq!(read_body(&mut r, 2).unwrap(), b"{}");
     }
 
@@ -236,7 +325,7 @@ mod tests {
     fn accepts_bare_newlines() {
         let h = head("GET /health HTTP/1.1\nHost: x\n\n").unwrap();
         assert_eq!(h.path, "/health");
-        assert_eq!(h.content_length(), Ok(0));
+        assert_eq!(h.content_length(MAX_BODY), Ok(0));
     }
 
     #[test]
@@ -264,9 +353,9 @@ mod tests {
             MAX_BODY + 1
         ))
         .unwrap();
-        assert_eq!(h.content_length().unwrap_err().0, 413);
+        assert_eq!(h.content_length(MAX_BODY).unwrap_err().0, 413);
         let h = head("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
-        assert_eq!(h.content_length().unwrap_err().0, 411);
+        assert_eq!(h.content_length(MAX_BODY).unwrap_err().0, 411);
         let h = head("POST / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n").unwrap();
         assert!(h.expects_continue());
     }

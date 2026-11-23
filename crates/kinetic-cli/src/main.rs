@@ -68,6 +68,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve decision models through the TypeSafe System One API
+    ServeSystemone {
+        /// JSON catalog of decision models and their providers
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Read the client-facing bearer key from this environment variable
+        #[arg(long, value_name = "VAR")]
+        api_key_env: Option<String>,
+    },
     /// Interactive CPU diffusion chat with animated progress and Markdown
     DiffuseChat {
         #[command(flatten)]
@@ -589,6 +602,34 @@ fn finish(result: Result<()>) -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::ServeSystemone {
+            config,
+            host,
+            port,
+            api_key_env,
+        } => {
+            let bytes = std::fs::read(&config)?;
+            let base_dir = config.parent().unwrap_or_else(|| Path::new("."));
+            let server = kinetic_server::systemone::Server::from_json(&bytes, base_dir)
+                .map_err(|e| format!("{}: {e}", config.display()))?;
+            let api_key = api_key_env
+                .map(|name| {
+                    std::env::var(&name)
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| format!("missing or empty environment variable {name}"))
+                })
+                .transpose()?;
+            let listener = TcpListener::bind((host.as_str(), port))
+                .map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
+            eprintln!("Serving System One at http://{}", listener.local_addr()?);
+            kinetic_server::serve_systemone(
+                &server,
+                listener,
+                &kinetic_server::Options { api_key },
+            );
+            Ok(())
+        }
         Command::DiffuseChat { args } => {
             set_threads(args.threads)?;
             diffusion_chat::run(args)

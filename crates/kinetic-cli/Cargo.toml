@@ -20,6 +20,8 @@ cuda = ["kinetic-server/cuda", "dep:kinetic-cuda"]
 # compiled to SPIR-V at build time and the loader is opened at runtime, so
 # this needs no SDK to build and no driver to start.
 vulkan = ["kinetic-server/vulkan", "dep:kinetic-vulkan"]
+laya-onnx = ["kinetic-server/laya-onnx"]
+jeff-onnx = ["kinetic-server/jeff-onnx"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
